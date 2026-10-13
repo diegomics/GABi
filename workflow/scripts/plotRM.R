@@ -183,8 +183,8 @@ parseConfig <- function(configIN) {
     for (j in seq(2, ncol(curTab), 1)) {
       category <- colnames(curTab)[j]
 
-      # Convert slashes to dots to match color scheme
-      category <- gsub("/", ".", category)
+      # Convert slashes AND hyphens to dots to match the colour scheme.
+      category <- gsub("[/-]", ".", category)
 
       df <- data.frame(
         Kimura = as.character(curTab[[1]]),  # Divergence column
@@ -223,12 +223,29 @@ repData <- repData[!repData$Category %in% excludeCategories, ]
 # Set factor levels for proper stacking order (reverse for bottom-to-top)
 # Only include categories that are actually present in the data
 presentCategories <- intersect(rev(landscapeOrder), unique(repData$Category))
-repData$Category <- factor(repData$Category, levels=presentCategories)
+
+# A class RepeatMasker reports but landscapeOrder has never heard of used to
+# become factor NA here and was then deleted by complete.cases() below - gone
+# from the plot, with nothing said. Keep it instead, painted grey, and say so.
+unlistedCategories <- setdiff(unique(repData$Category), presentCategories)
+if (length(unlistedCategories) > 0) {
+  cat(sprintf("WARNING: %d repeat class(es) absent from landscapeOrder, drawn in grey: %s\n",
+              length(unlistedCategories), paste(unlistedCategories, collapse=", ")))
+  # An explicit colour rather than leaning on scale_fill_manual's na.value, so
+  # every level is coloured regardless of how a given ggplot2 version treats a
+  # named values vector that is missing a level.
+  customCols[unlistedCategories] <- "#CCCCCC"
+}
+
+# Unlisted classes go last, so they stack at the bottom beside Unknown.
+repData$Category <- factor(repData$Category,
+                           levels=c(presentCategories, unlistedCategories))
 
 # Convert Kimura to numeric for proper x-axis ordering
 repData$Kimura <- as.numeric(repData$Kimura)
 
-# Remove any NA values
+# Drop rows with a missing Kimura or percentage. Category can no longer be NA:
+# every class observed in the data is now a level.
 repData <- repData[complete.cases(repData), ]
 
 # Report summary
