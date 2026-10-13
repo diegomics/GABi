@@ -1,0 +1,2669 @@
+# GABi - Genomes Analysis Made Easy
+# by Diego De Panis, 2026
+# note: AI tools may have been used to improve, clean and/or comment this version of the code
+
+GABi_VER = "0.1.0-alpha_build.261013"
+
+# Debug verbosity (set to True for detailed DAG building messages)
+VERBOSE = False
+
+
+# -------------------------------------------------------------------------------
+# IMPORTS
+# -------------------------------------------------------------------------------
+
+import os
+import sys
+import re
+import glob
+import shutil
+import tempfile
+import yaml
+import json
+import copy
+import subprocess
+import urllib.request
+import urllib.parse
+from urllib.error import URLError, HTTPError
+from urllib.parse import urlparse, unquote
+from pathlib import Path
+
+# GABi's [GABi] notes go to stdout; Snakemake's own logger goes to stderr.
+# Under a combined redirect (nohup ... > log 2>&1) stderr is unbuffered while
+# stdout is block-buffered, so GABi's notes can surface far from the Snakemake
+# lines they belong beside. Line buffering keeps a combined log readable. It
+# changes nothing for `> out` alone, where the notes were already in order.
+# Guarded: a stdout replaced by something without .reconfigure() (a test
+# harness, an embedding host) must not take the run down with it.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except (AttributeError, ValueError, OSError):
+    pass
+
+# Minimum Snakemake version required by GABi
+GABi_MIN_SNAKEMAKE = "9.27.0"
+from snakemake import __version__ as _SMK_VERSION
+from packaging.version import Version as _Version
+if _Version(_SMK_VERSION) < _Version(GABi_MIN_SNAKEMAKE):
+    sys.stderr.write(
+        f"\n[GABi] ERROR: Snakemake version should be at least {GABi_MIN_SNAKEMAKE} "
+        f"(you are using {_SMK_VERSION}).\n"
+        f"[GABi] Please update the GABi_env, e.g. recreate it from the GABi folder with:\n"
+        f"[GABi]   conda deactivate; conda env remove -n GABi_env; conda env create -f install.yml\n\n"
+    )
+    sys.exit(1)
+
+
+
+# -------------------------------------------------------------------------------
+# MAIN-PROCESS DETECTION
+# -------------------------------------------------------------------------------
+# Guards top-level prints (banners, logs) against re-execution in worker processes.
+# IS_MAIN is True only in the parent process; workers skip noisy prints.
+#
+# note: Running Snakemake via srun/sbatch may suppress the banner (the pipeline
+# still runs fine). To keep it, drop the SLURM_JOB_ID check below.
+
+def is_main_process():
+    """Return True if this is the main Snakemake process, not a worker."""
+    # Cluster workers (SLURM injects SLURM_JOB_ID into every job);
+    # Snakemake also sets its own job IDs in the worker environment.
+    is_cluster_worker = any([
+        os.environ.get("SNAKEMAKE_JOBID"),
+        os.environ.get("SNAKEMAKE_SLURM_JOBID"),
+        os.environ.get("SLURM_JOB_ID"),
+    ])
+    # Local workers (Snakemake re-invokes itself with `--mode subprocess`).
+    is_local_worker = False
+    for i, arg in enumerate(sys.argv):
+        if arg == "--mode" and i + 1 < len(sys.argv) and sys.argv[i + 1] == "subprocess":
+            is_local_worker = True
+            break
+    return not (is_cluster_worker or is_local_worker)
+
+
+IS_MAIN = is_main_process()
+
+
+# -------------------------------------------------------------------------------
+# CONSTANTS & MAIN PATHS
+# -------------------------------------------------------------------------------
+
+BASEDIR = Path(workflow.basedir)
+ROOT = BASEDIR.parent
+scripts_dir = BASEDIR / "scripts"
+
+# Add scripts directory to path for custom modules
+if str(scripts_dir) not in sys.path:
+    sys.path.insert(0, str(scripts_dir))
+
+from resource_calc import ResourceCalculator, create_resource_functions
+
+# SMK! Load main control_panel yaml file in the config dictionary
+CONFIG = ROOT / "config" / "control_panel.yaml"
+if not CONFIG.exists():
+    raise FileNotFoundError(f"Config file not found: {CONFIG}")
+configfile: str(CONFIG)
+
+
+# -------------------------------------------------------------------------------
+# UTILITIES
+# -------------------------------------------------------------------------------
+
+# --- URL / accession / path detection ---
+def is_url(value: str) -> bool:
+    """Check if value is a URL"""
+    return isinstance(value, str) and (
+        value.startswith(('http://', 'https://', 'ftp://', 'www.'))
+    )
+
+def is_sra_accession(value: str) -> bool:
+    """Check if value is an SRA/ENA accession"""
+    if not isinstance(value, str):
+        return False
+    # Match SRR/ERR/DRR followed by numbers
+    return bool(re.match(r'^[SED]RR\d+$', value))
+
+def is_ncbi_assembly_accession(value: str) -> bool:
+    """Check if value is an NCBI assembly accession (GenBank or RefSeq)"""
+    if not isinstance(value, str):
+        return False
+    import re
+    # Match GCA_XXXXXXXXX.X or GCF_XXXXXXXXX.X
+    return bool(re.match(r'^GC[AF]_\d{9}\.\d+$', value))
+
+def is_existing_path(value: str) -> bool:
+    """Check if value is an existing local path"""
+    if not isinstance(value, str) or is_url(value) or is_sra_accession(value):
+        return False
+    return Path(value).exists()
+
+def extract_filename_from_url(url: str) -> str:
+    """Extract filename from URL"""
+    parsed = urlparse(url)
+    filename = Path(unquote(parsed.path)).name
+    return filename if filename else "downloaded_file"
+
+# --- Config value coercion ---
+# GABi_TEST_HELPERS_BEGIN
+_TRUE_WORDS = {"1", "true", "t", "yes", "y", "on"}
+_FALSE_WORDS = {"0", "false", "f", "no", "n", "off", ""}
+
+
+def _as_bool(x, default=False):
+    """Convert various true/false representations to boolean.
+
+    Raises on anything else. Returning False for an unrecognised string meant
+    a typo silently turned a flag off: 'TRIM_PE: maybe' read as "don't trim".
+
+    Unquoted on/off/yes/no in the YAML are already real booleans by the time
+    they arrive (PyYAML resolves YAML 1.1 booleans), so this matters for
+    quoted values and for --config FLAG=off on the command line, where
+    Snakemake keeps the string.
+    """
+    if isinstance(x, bool):
+        return x
+    if x is None:
+        return default
+    if isinstance(x, (int, float)):
+        return bool(x)
+    s = str(x).strip().lower()
+    if s in _TRUE_WORDS:
+        return True
+    if s in _FALSE_WORDS:
+        return False
+    raise ValueError(
+        f"[GABi] {x!r} is not a yes/no value. Use on/off (or true/false, yes/no)."
+    )
+# GABi_TEST_HELPERS_END
+
+# --- Read-type normalization ---
+# GABi_TEST_HELPERS_BEGIN
+# read_type is free text: NomNom identifies the column but does not validate or
+# map its values, so whatever the submitter typed reaches GABi verbatim. That
+# makes this column the pipeline's weakest input, and a wrong guess is worse
+# than a stop - so match against explicit alias sets and let
+# validate_samples_config() reject anything unrecognised, once, at load.
+#
+# This replaced substring matching, which guessed: "pacbio" was in the HiFi
+# term list, so 'pacbio_clr' silently became 'hifi' and received the ULI primer
+# check and the SMRTbell adapter filter, neither meaningful for CLR data; and
+# "pe"/"sr" as substrings matched inside unrelated words ('omni-c PE' ->
+# 'omnicpe' -> illumina, before the Hi-C branch was ever reached).
+_READ_TYPE_ALIASES = {
+    "hifi": {
+        "hifi", "hifireads", "pacbiohifi", "pacbiohifireads", "pbhifi",
+        "ccs", "pacbioccs", "pbccs", "revio", "sequelii", "sequel2",
+    },
+    "ont": {
+        "ont", "ontreads", "nanopore", "oxfordnanopore",
+        "oxfordnanoporetechnologies", "minion", "promethion", "gridion",
+        "ontr104", "ontr9", "ontr10",
+    },
+    "10x": {
+        "10x", "10xgenomics", "10xchromium", "tenx", "chromium",
+        "linked", "linkedreads",
+    },
+    "illumina": {
+        "illumina", "illuminape", "shortreads", "shortread", "pairedend",
+        "pe", "sr", "wgs",
+    },
+    # Hi-C normalises, but nothing downstream consumes it. Left exactly as it
+    # was on purpose - see the NON_CALLABLE_TECHS note further down.
+    "hic": {"hic", "arima", "omnic", "dovetail", "proximityligation"},
+}
+
+# Recognised spellings GABi deliberately does not process. Named separately so
+# the error says what is wrong instead of only listing what is accepted.
+_READ_TYPE_UNSUPPORTED = {
+    "clr": "PacBio CLR", "pacbioclr": "PacBio CLR", "pbclr": "PacBio CLR",
+    "iontorrent": "Ion Torrent", "sanger": "Sanger",
+    "bgi": "BGI/DNBSEQ", "dnbseq": "BGI/DNBSEQ", "mgi": "BGI/DNBSEQ",
+}
+
+_RT_BY_ALIAS = {a: canon for canon, aliases in _READ_TYPE_ALIASES.items() for a in aliases}
+
+
+def _canon_rt(read_type):
+    """Fold a free-text read type to its comparison form: 'PacBio HiFi' -> 'pacbiohifi'."""
+    return re.sub(r"[^a-z0-9]", "", str(read_type).lower())
+
+
+def normalize_read_type(read_type):
+    """
+    Normalize read type to standard categories.
+    Returns one of 'hifi', 'ont', '10x', 'illumina', 'hic', None for an empty
+    value, or the lowercased original when unrecognised - which
+    validate_samples_config() turns into an error before any job is scheduled.
+    """
+    if not read_type or read_type == "None":
+        return None
+    return _RT_BY_ALIAS.get(_canon_rt(read_type), str(read_type).lower())
+
+
+def read_type_problem(read_type):
+    """Why this read_type is not usable, or None if it is fine."""
+    if not read_type or read_type == "None":
+        return None
+    canon = _canon_rt(read_type)
+    if canon in _RT_BY_ALIAS:
+        return None
+    if canon in _READ_TYPE_UNSUPPORTED:
+        return (f"{_READ_TYPE_UNSUPPORTED[canon]} data is not processed by GABi"
+                if canon not in ("clr", "pacbioclr", "pbclr")
+                else "PacBio CLR is not processed by GABi (HiFi/CCS reads only)")
+    return "unrecognised read type"
+
+
+def accepted_read_types():
+    """Accepted spellings, grouped, for error messages."""
+    return "\n".join(
+        f"          {canon:9s} {', '.join(sorted(_READ_TYPE_ALIASES[canon]))}"
+        for canon in ("hifi", "ont", "illumina", "10x", "hic")
+    )
+# GABi_TEST_HELPERS_END
+
+# --- Read-type predicates ---
+def _is_long(rt):
+    """Check if read type is long read (works with both raw and normalized types)"""
+    rt_norm = normalize_read_type(rt)
+    return rt_norm in {"hifi", "ont"}
+
+def _is_short(rt):
+    """Check if read type is short/paired-end read (works with both raw and normalized types)"""
+    rt_norm = normalize_read_type(rt)
+    return rt_norm in {"illumina", "10x"}
+
+#def _is_pe(rt):
+#    """Check if read type produces paired-end files"""
+#    rt_norm = normalize_read_type(rt)
+#    return rt_norm in {"illumina", "10x", "hic"}
+
+def _is_10x(rt):
+    """Check if read type is 10x linked reads"""
+    rt_norm = normalize_read_type(rt)
+    return rt_norm == "10x"
+
+#def _is_hic(rt):
+#    """Check if read type is 10x linked reads"""
+#    rt_norm = normalize_read_type(rt)
+#    return rt_norm == "hic"
+
+# --- Read-path utilities ---
+# GABi_TEST_HELPERS_BEGIN
+# Everything between these markers must stay free of Snakemake/config state:
+# tests/test_naming.py extracts this block and exec()s it verbatim.
+_READ_EXTS = (".fastq.gz", ".fq.gz", ".fastq", ".fq", ".gz")
+# Separator for BAM file names
+_SEP = "_"
+
+# Mate-token handling, in three ordered steps, because a bcl2fastq chunk number
+# has to survive while the mate marker must not:
+#   1. ..._R1_001 -> ..._R_001    collapse the mate digit, KEEP the chunk
+#   2. ..._1 / ...-R2 / ....R1 -> ...   drop a trailing mate marker
+#   3. only when 1 and 2 found nothing, and only for a declared pair: drop the
+#      single 1/2 that R2 confirms, wherever it sits (..._1_cov14x -> ..._cov14x).
+#      Steps 1-2 are end-anchored and read R1 alone, so a marker in the middle
+#      of a name survived into every output path for that library. See _pe_base().
+#
+# The separator in step 2 is deliberately NOT optional. When it was optional,
+# any trailing digit was stripped: 'chr1' -> 'ch', 'sample_v2' -> 'sample_v',
+# 'm84093_240101_112233_s1' -> '..._s', and - worse - the two chunks of one
+# library ('..._R1_001' and '..._R1_002') both collapsed to '..._R1_00',
+# leaking the mate marker into a base whose whole job is to name the library.
+# A name with no separator before the marker (libAR1) is therefore left alone;
+# NomNom's own pair detection would not have paired such files either.
+_PAIR_CHUNK_RE = re.compile(r"([._-])R[12](_\d+)$", re.IGNORECASE)
+_PAIR_TAIL_RE  = re.compile(r"[._-]R?[12]$", re.IGNORECASE)
+# Word-style mate markers. NomNom pairs _F/_R, Forward/Reverse and Left/Right,
+# so a declared pair may use them - but GABi never builds a base from them.
+# Used ONLY to compare a declared R1 against its R2.
+_PAIR_WORD_RE  = re.compile(r"[._-](?:F|R|fwd|rev|forward|reverse|left|right)$", re.IGNORECASE)
+# Centralization prefix, e.g. 'Path2_'
+_PATH_PREFIX_RE = re.compile(r"^Path\d+_")
+
+
+def _strip_ext(p):
+    """Remove common read file extensions"""
+    bn = os.path.basename(p)
+    for ext in _READ_EXTS:
+        if bn.endswith(ext):
+            return bn[:-len(ext)]
+    return os.path.splitext(bn)[0]
+
+
+def _strip_pair_token(bn):
+    """Remove the mate marker from a basename, keeping any chunk number."""
+    bn = _PAIR_CHUNK_RE.sub(r"\1R\2", bn)
+    return _PAIR_TAIL_RE.sub("", bn)
+
+
+def _read_stem(path, strip_mate=False, strip_prefix=False):
+    """Comparable stem of a read path.
+
+    strip_mate is OFF by default and must stay that way for long reads: a HiFi
+    library legitimately called m64_run_1.fq.gz would otherwise lose its '_1',
+    which is part of the library name, not a mate marker. No regex can tell
+    those two apart - only the call site knows which it is looking at.
+    """
+    bn = _strip_ext(path)
+    if strip_prefix:
+        bn = _PATH_PREFIX_RE.sub("", bn)
+    if strip_mate:
+        bn = _strip_pair_token(bn)
+        bn = _PAIR_WORD_RE.sub("", bn)
+    return bn
+
+
+def _mate_diff_index(a, b):
+    """Position of the single 1/2 that distinguishes a declared R1/R2 pair.
+
+    Returns the index into `a`, or None when the two basenames cannot be
+    confirmed as mates from the names alone. Confirmation needs all of:
+    same length, exactly one differing character, '1' in a against '2' in b,
+    and that digit not part of a longer number. That covers every convention
+    GABi sees ('x_1_cov14x', 'x_R1_001', 'x.1', 'x_1') and rejects the
+    look-alikes: 'lib_11_x' vs 'lib_12_x' is two libraries, 's_cov14x' vs
+    's_cov24x' is two coverages, 'L001_R1' vs 'L002_R2' differs twice.
+    """
+    if a == b or len(a) != len(b):
+        return None
+    idx = -1
+    for i, (ca, cb) in enumerate(zip(a, b)):
+        if ca == cb:
+            continue
+        if idx != -1:
+            return None          # more than one difference
+        idx = i
+    if idx == -1 or a[idx] != "1" or b[idx] != "2":
+        return None
+    if idx and a[idx - 1].isdigit():
+        return None
+    if idx + 1 < len(a) and a[idx + 1].isdigit():
+        return None
+    return idx
+
+
+def _mates_look_paired(r1, r2):
+    """True when two declared read files look like R1/R2 of one library.
+
+    Names only - it cannot see contents, so a genuinely mismatched pair that
+    is named consistently still passes. Feeds a warning, never a rejection.
+    Identical basenames in different directories (R1/lib.fq.gz, R2/lib.fq.gz)
+    are a real convention and count as paired; the same file declared twice
+    does not.
+    """
+    if r1 == r2:
+        return False
+    a, b = _strip_ext(r1), _strip_ext(r2)
+    if _mate_diff_index(a, b) is not None:
+        return True
+    # Word-style markers (_F/_R, fwd/rev, left/right) and anything else the
+    # end-anchored rules can strip: compare whatever is left of the two names.
+    return _read_stem(r1, strip_mate=True) == _read_stem(r2, strip_mate=True)
+
+
+def _pe_base(r1, r2):
+    """Base name shared by a declared PE pair (step 3 above).
+
+    Defers to _strip_pair_token() whenever that resolves something, so every
+    name that already produced a base produces byte-identical output; the
+    pair-confirmed cut only runs on names the end-anchored rules cannot see.
+    An unconfirmed pair keeps R1's name, exactly as before - the cross-check
+    warns about it rather than guessing.
+
+    Note the deliberate asymmetry with _mates_look_paired(): the cross-check
+    accepts any confirmed 1/2, because a quiet warning costs nothing, while
+    the base only cuts a marker that is separated the way steps 1-2 require,
+    because a changed base renames every output file for that library.
+    """
+    a = _strip_ext(r1)
+    stripped = _strip_pair_token(a)
+    if stripped != a:
+        # `or a`: a file named literally '_1.fq.gz' strips to nothing, and an
+        # empty base cannot satisfy the base=[^/]+ constraint on the B/D
+        # outputs - it failed the DAG with an opaque message instead.
+        return stripped or a
+    i = _mate_diff_index(a, _strip_ext(r2))
+    if i is None:
+        return a
+    left, right = a[:i], a[i + 1:]
+    if left[-1:] in ("R", "r"):
+        left = left[:-1]
+    # Step 2's separator rule holds here too: 'libAR1' keeps its marker even
+    # though R2 confirms it, so a name GABi would not have touched before is
+    # not renamed now. Only '..._1', '...-1', '....1' and their R-prefixed
+    # forms are cut.
+    if left[-1:] not in (".", "_", "-"):
+        return a
+    left = left[:-1]
+    # Degenerate input ('_1.fq.gz' / '_2.fq.gz') would leave nothing to name
+    # the library after: keep R1's stem rather than emit an empty wildcard.
+    return (left + right) or a
+# GABi_TEST_HELPERS_END
+
+# Pairs already reported by the mate cross-check. _enumerate_groups() runs many
+# times during DAG construction; the warning is worth seeing once.
+_MATE_WARNED = set()
+
+# --- Read basename extraction ---
+#def get_read_basename(filepath):
+#    """Extract base name from read file path"""
+#    if not filepath or filepath == "None":
+#        return "unknown"
+#
+#    basename = os.path.basename(filepath)
+#    # Remove extensions (.fq, .fastq, .fq.gz, .fastq.gz)
+#    basename = basename.replace('.fastq.gz', '').replace('.fq.gz', '')
+#    basename = basename.replace('.fastq', '').replace('.fq', '')
+#    return basename
+
+
+# -------------------------------------------------------------------------------
+# DATA TABLE HANDLING
+# -------------------------------------------------------------------------------
+
+def download_data_table(url: str, output_dir: Path) -> Path:
+    """Download data table from URL with special handling for Google Sheets"""
+
+    if IS_MAIN: print(f"[GABi] DATA_TABLE is a URL: {url}")
+    # Special handling for Google Sheets
+    if 'docs.google.com/spreadsheets' in url:
+        match = re.search(r'/d/([a-zA-Z0-9-_]+)', url)
+        if match:
+            sheet_id = match.group(1)
+            # Export as CSV
+            url = f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv'
+            if IS_MAIN: print(f"[GABi] Detected Google Sheets, converting to export URL")
+            filename = f"data_table_{sheet_id}.csv"
+        else:
+            raise ValueError("Could not extract spreadsheet ID from Google Sheets URL")
+    else:
+        # Try to get filename from URL
+        parsed = urllib.parse.urlparse(url)
+        filename = Path(parsed.path).name if parsed.path else "downloaded_data_table.csv"
+
+        # Ensure proper extension
+        valid_exts = ['.csv', '.tsv', '.txt', '.xlsx', '.xls']
+        if not any(filename.endswith(ext) for ext in valid_exts):
+            filename += '.csv'
+
+    output_path = output_dir / filename
+
+    # Check if already downloaded
+    if output_path.exists():
+        if IS_MAIN: print(f"[GABi] Using cached data table: {output_path}")
+        return output_path
+
+    # Download the file
+    if IS_MAIN: print(f"[GABi] Downloading data table...")
+    try:
+        urllib.request.urlretrieve(url, output_path)
+        if IS_MAIN: print(f"[GABi] Data table downloaded to: {output_path}")
+    except (URLError, HTTPError) as e:
+        raise ValueError(f"❌ Failed to download data table from {url}: {e}")
+
+    return output_path
+
+# Get values from config to define paths
+required_keys = ["DATA_TABLE", "OUT_FOLDER"]
+missing = [k for k in required_keys if k not in config]
+if missing:
+    raise ValueError(f"Missing required config keys: {missing}")
+
+data_table_value = config["DATA_TABLE"]
+out_folder = Path(config["OUT_FOLDER"]) / "GABi_results"
+out_folder.mkdir(parents=True, exist_ok=True)
+
+# Handle URL or local path for DATA_TABLE
+if isinstance(data_table_value, str):
+    # Normalize URLs starting with just "www."
+    if data_table_value.startswith("www."):
+        if IS_MAIN: print(f"[GABi] URL starts with 'www.' - prepending 'https://'")
+        data_table_value = "https://" + data_table_value
+
+    # Check if it's a URL
+    if data_table_value.startswith(("http://", "https://")):
+        input_table = download_data_table(data_table_value, out_folder)
+    else:
+        input_table = Path(data_table_value)
+        if not input_table.exists():
+            raise FileNotFoundError(f"Data table not found: {input_table}")
+else:
+    input_table = Path(str(data_table_value))
+    if not input_table.exists():
+        raise FileNotFoundError(f"Data table not found: {input_table}")
+
+yaml_output = out_folder / "data_config.yaml"
+
+
+# -------------------------------------------------------------------------------
+# CONTAINERS
+# -------------------------------------------------------------------------------
+
+# Load container configurations
+containers_path = BASEDIR / "envs" / "containers.yaml"
+
+if not containers_path.exists():
+    raise FileNotFoundError(f"Containers config not found: {containers_path}")
+
+with containers_path.open() as f:
+    data = yaml.safe_load(f) or {}
+
+CONTAINERS = data.get("containers", {})
+
+if not CONTAINERS:
+    raise ValueError(f"{containers_path} is missing a top-level 'containers:' mapping")
+
+
+# -------------------------------------------------------------------------------
+# ORTHODB VERSION (compleasm)
+# -------------------------------------------------------------------------------
+
+# Single source of truth for the OrthoDB release compleasm uses. Everything that
+# names a lineage DB derives from it: the A00 download flags, the shared DB that
+# A02 copies per job, and `compleasm run --odb`. compleasm stores each lineage as
+# "<lineage>_<odb>" (e.g. diptera_odb12), so two versions in one library_path give
+# you a second DB instead of an error - hence one value for the whole pipeline.
+# Override in the control panel with e.g. ODB_VERSION: odb12.2
+ODB_VERSION = str(config.get("ODB_VERSION", "odb12")).strip()
+if not ODB_VERSION.startswith("odb"):
+    ODB_VERSION = "odb" + ODB_VERSION
+if not re.fullmatch(r"odb\d+(\.\d+)?", ODB_VERSION):
+    print("[GABi] ERROR: ODB_VERSION must look like 'odb12' or 'odb12.2', got: "
+          f"{config.get('ODB_VERSION')!r}")
+    sys.exit(1)
+if IS_MAIN: print(f"[GABi] OrthoDB release for compleasm: {ODB_VERSION}")
+
+
+# -------------------------------------------------------------------------------
+# TEMP DIRECTORY LOGIC
+# -------------------------------------------------------------------------------
+
+# TEMP_DIR options:
+#   "default" or "" -> OUT_FOLDER/GABi_results/tmp
+#   "auto" -> detect from profile's apptainer-args, check space at runtime, fall back
+#   "{path}" -> use that path
+#
+# FAST_TEMP_DIR options:
+#   "default" or "" -> same as TEMP_DIR (shows hints for faster options)
+#   "{path}" -> use that path
+
+# --- Discovery functions ---
+def _detect_ramfs_mounts():
+    """Detect RAM-mounted filesystems"""
+    mounts = []
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3:
+                    dev, mnt, fstype = parts[0], parts[1], parts[2]
+                    if fstype in ("tmpfs", "ramfs", "hugetlbfs"):
+                        try:
+                            st = os.statvfs(mnt)
+                            free_gb = st.f_bavail * st.f_frsize / (1024**3)
+                        except:
+                            free_gb = None
+                        mounts.append((mnt, fstype, free_gb))
+    except:
+        pass
+    return mounts
+
+def _parse_fast_paths_from_profiles():
+    """
+    Parse apptainer-args from execution profiles to find fast temp paths.
+    Returns a list of paths in priority order (localscratch > local > home).
+    Appends /tmp to each path for organization.
+    """
+    profile_paths = [
+        ROOT / "execution" / "slurm" / "profile.yaml",
+        ROOT / "execution" / "local" / "profile.yaml",
+    ]
+
+    # Priority order: localscratch first, then local, then home
+    fast_keywords_priority = [
+        ("/localscratch", 1),
+        ("/local/", 2),
+        ("/home", 3),
+    ]
+
+    found_paths = []  # List of (priority, path)
+
+    for profile_path in profile_paths:
+        if not profile_path.exists():
+            continue
+        try:
+            with open(profile_path) as f:
+                profile_config = yaml.safe_load(f) or {}
+
+            # Look for apptainer-args or singularity-args
+            apptainer_args = profile_config.get("apptainer-args", "") or profile_config.get("singularity-args", "")
+
+            if not apptainer_args:
+                continue
+
+            # Parse --bind arguments: --bind /path:/path or --bind /path
+            bind_matches = re.findall(r'--bind\s+([^\s]+)', apptainer_args)
+
+            for bind_arg in bind_matches:
+                # Handle both /path:/path and /path formats
+                source_path = bind_arg.split(":")[0]
+
+                # Check if this path matches our fast keywords
+                for keyword, priority in fast_keywords_priority:
+                    if keyword in source_path:
+                        # Add /tmp subdirectory for organization
+                        tmp_path = os.path.join(source_path, "tmp")
+                        # Avoid duplicates
+                        if tmp_path not in [p[1] for p in found_paths]:
+                            found_paths.append((priority, tmp_path))
+                            if IS_MAIN: print(f"[GABi] Found fast temp candidate from profile: {tmp_path} (priority {priority})")
+                        break
+
+        except Exception as e:
+            print(f"[GABi] Warning: Could not parse {profile_path}: {e}")
+            continue
+
+    # Sort by priority and return just the paths
+    found_paths.sort(key=lambda x: x[0])
+    return [p[1] for p in found_paths]
+
+# Default fallback is always available
+FALLBACK_TMP = os.path.join(config["OUT_FOLDER"], "GABi_results", "tmp")
+os.makedirs(FALLBACK_TMP, exist_ok=True)
+
+# --- Parse TEMP_DIR config ---
+_temp_dir_raw = str(config.get("TEMP_DIR", "")).strip().lower()
+
+if _temp_dir_raw in ("", "default"):
+    TEMP_DIR = FALLBACK_TMP
+    TEMP_DIR_CANDIDATES = [FALLBACK_TMP]
+    if IS_MAIN: print(f"[GABi] TEMP_DIR -> {TEMP_DIR}")
+elif _temp_dir_raw == "auto":
+    # Try to detect from profile's apptainer-args
+    detected_paths = _parse_fast_paths_from_profiles()
+    if detected_paths:
+        TEMP_DIR = detected_paths[0]  # Primary choice
+        TEMP_DIR_CANDIDATES = detected_paths + [FALLBACK_TMP]  # All options including fallback
+        if IS_MAIN: print(f"[GABi] TEMP_DIR -> {TEMP_DIR} (auto, with {len(detected_paths)} fast option(s))")
+        if IS_MAIN: print(f"[GABi] Fallback chain: {' -> '.join(TEMP_DIR_CANDIDATES)}")
+    else:
+        TEMP_DIR = FALLBACK_TMP
+        TEMP_DIR_CANDIDATES = [FALLBACK_TMP]
+        if IS_MAIN: print(f"[GABi] TEMP_DIR -> {TEMP_DIR} (auto, no fast path detected in profiles)")
+else:
+    # User-specified path - also add /tmp subdirectory
+    user_path = str(config.get("TEMP_DIR", "")).strip()
+    if not user_path.endswith("/tmp"):
+        TEMP_DIR = os.path.join(user_path, "tmp")
+    else:
+        TEMP_DIR = user_path
+    TEMP_DIR_CANDIDATES = [TEMP_DIR, FALLBACK_TMP]
+    if IS_MAIN: print(f"[GABi] TEMP_DIR -> {TEMP_DIR}")
+# --- Parse FAST_TEMP_DIR config ---
+_fast_temp_raw = str(config.get("FAST_TEMP_DIR", "")).strip().lower()
+
+if _fast_temp_raw in ("", "default"):
+    FAST_TEMP_DIR = TEMP_DIR  # Same as TEMP_DIR by default
+    # Show hints about better options
+    ram_options = _detect_ramfs_mounts()
+    if ram_options:
+        if IS_MAIN: print(f"[GABi] FAST_TEMP_DIR -> {FAST_TEMP_DIR}")
+        if IS_MAIN: print(f"[GABi] ⚡ RAM-mounted filesystems detected - consider setting FAST_TEMP_DIR for faster I/O:")
+        for mnt, typ, free_gb in ram_options:
+            if free_gb is not None:
+                if IS_MAIN: print(f"       - {mnt} [{typ}] ~{free_gb:.1f} GiB free")
+            else:
+                if IS_MAIN: print(f"       - {mnt} [{typ}]")
+    else:
+        if IS_MAIN: print(f"[GABi] FAST_TEMP_DIR -> {FAST_TEMP_DIR}")
+else:
+    # User-specified path - also add /tmp subdirectory
+    user_fast_path = str(config.get("FAST_TEMP_DIR", "")).strip()
+    if not user_fast_path.endswith("/tmp"):
+        FAST_TEMP_DIR = os.path.join(user_fast_path, "tmp")
+    else:
+        FAST_TEMP_DIR = user_fast_path
+    if IS_MAIN: print(f"[GABi] FAST_TEMP_DIR -> {FAST_TEMP_DIR}")
+# Build the candidates list as a colon-separated string for shell
+TEMP_CANDIDATES_STR = ":".join(TEMP_DIR_CANDIDATES)
+
+# Export for every shell step (works inside Apptainer too)
+# Include a helper function for runtime space checking with multiple fallbacks
+shell.prefix(
+    f"set -euo pipefail; "
+    f"export TMPDIR='{TEMP_DIR}'; "
+    f"export GABi_TMP='{TEMP_DIR}'; "
+    f"export GABi_FAST_TMP='{FAST_TEMP_DIR}'; "
+    f"export GABi_FALLBACK_TMP='{FALLBACK_TMP}'; "
+    f"export GABi_TMP_CANDIDATES='{TEMP_CANDIDATES_STR}'; "
+    # Function to get work dir with space check and multiple fallbacks
+    """
+gabi_get_workdir() {{
+    local REQUIRED_GB="${{1:-100}}"
+    local PENALTY_PER_JOB=50  # Subtract 50GB per existing GABi temp folder
+    local FALLBACK="${{GABi_FALLBACK_TMP:-/tmp}}"
+
+    echo "[GABi] Temp directory selection:" >&2
+    echo "[GABi]   Required: ${{REQUIRED_GB}} GB (with ${{PENALTY_PER_JOB}} GB penalty per existing GABi job)" >&2
+
+    # Parse candidates (colon-separated)
+    IFS=':' read -ra CANDIDATES <<< "${{GABi_TMP_CANDIDATES:-$FALLBACK}}"
+
+    for CANDIDATE in "${{CANDIDATES[@]}}"; do
+        echo "[GABi]   Checking: $CANDIDATE" >&2
+
+        # Check if directory exists or can be created
+        if ! mkdir -p "$CANDIDATE" 2>/dev/null; then
+            echo "[GABi]     Cannot create/access directory" >&2
+            continue
+        fi
+
+        # Get available space
+        AVAIL_KB=$(df -k "$CANDIDATE" 2>/dev/null | awk 'NR==2 {{print $4}}' || echo "0")
+        AVAIL_GB=$((AVAIL_KB / 1024 / 1024))
+
+        # Count existing GABi temp folders directly in this tmp directory
+        EXISTING_JOBS=0
+        if [ -d "$CANDIDATE" ]; then
+            EXISTING_JOBS=$(find "$CANDIDATE" -maxdepth 1 -type d -name "GABi_*" 2>/dev/null | wc -l || echo "0")
+        fi
+
+        # Calculate adjusted available space
+        PENALTY=$((EXISTING_JOBS * PENALTY_PER_JOB))
+        ADJUSTED_GB=$((AVAIL_GB - PENALTY))
+
+        echo "[GABi]     Raw available: ${{AVAIL_GB}} GB" >&2
+        if [ "$EXISTING_JOBS" -gt 0 ]; then
+            echo "[GABi]     Existing GABi jobs: $EXISTING_JOBS (penalty: -${{PENALTY}} GB)" >&2
+            echo "[GABi]     Adjusted available: ${{ADJUSTED_GB}} GB" >&2
+        fi
+
+        # Check if adjusted space is sufficient
+        if [ "${{ADJUSTED_GB:-0}}" -ge "$REQUIRED_GB" ] 2>/dev/null; then
+            echo "[GABi] Using: $CANDIDATE (${{ADJUSTED_GB}} GB effective, ${{AVAIL_GB}} GB raw)" >&2
+            echo "$CANDIDATE"
+            return 0
+        fi
+
+        echo "[GABi]     ❌ Insufficient space (${{ADJUSTED_GB}} GB < ${{REQUIRED_GB}} GB required)" >&2
+    done
+
+    # All candidates exhausted, use fallback anyway with warning
+    mkdir -p "$FALLBACK" 2>/dev/null || true
+    FALLBACK_KB=$(df -k "$FALLBACK" 2>/dev/null | awk 'NR==2 {{print $4}}' || echo "0")
+    FALLBACK_GB=$((FALLBACK_KB / 1024 / 1024))
+    echo "[GABi] ⚠️  All fast options exhausted, using fallback: $FALLBACK (${{FALLBACK_GB}} GB free)" >&2
+    echo "$FALLBACK"
+}}
+"""
+)
+
+
+# -------------------------------------------------------------------------------
+# BANNER
+# -------------------------------------------------------------------------------
+
+banner = r"""
+_______/\\\\\\\\\\\\______/\\\\\\\\\______/\\\\\\\\\\\\\___________
+ _____/\\\//////////_____/\\\\\\\\\\\\\___\/\\\/////////\\\_________
+  ____/\\\_______________/\\\/////////\\\__\/\\\_______\/\\\__/\\\___
+   ___\/\\\____/\\\\\\\__\/\\\_______\/\\\__\/\\\\\\\\\\\\\\__\///____
+    ___\/\\\___\/////\\\__\/\\\\\\\\\\\\\\\__\/\\\/////////\\\__/\\\___
+     ___\/\\\_______\/\\\__\/\\\/////////\\\__\/\\\_______\/\\\_\/\\\___
+      ___\/\\\_______\/\\\__\/\\\_______\/\\\__\/\\\_______\/\\\_\/\\\___
+       ___\//\\\\\\\\\\\\/___\/\\\_______\/\\\__\/\\\\\\\\\\\\\/__\/\\\___
+        ____\////////////_____\///________\///___\/////////////____\///____
+
+    """
+
+if IS_MAIN:
+    print(banner, flush=True)
+    print("Genome Analysis for Biodiversity", flush=True)
+    print(f"v{GABi_VER}", flush=True)
+    print("https://github.com/diegomics/GABi", flush=True)
+    print(f"Output folder: {out_folder}", flush=True)
+    print("Pipeline starting NOW!", flush=True)
+    print("=" * 60, flush=True)
+
+
+# -------------------------------------------------------------------------------
+# RESOURCE CALCULATOR
+# -------------------------------------------------------------------------------
+
+if IS_MAIN:
+    try:
+        calculator = ResourceCalculator("config/resources.yaml", config)
+        cpu_func, mem_func, time_func = create_resource_functions(calculator)
+        print("Resource calculator initialized successfully")
+        print(f"   Max CPU: {calculator.user_cpu}, Max RAM: {calculator.user_ram}GB, Max Time: {calculator.user_runtime}h")
+    except Exception as e:
+        print(f"❌ Error initializing resource calculator: {e}")
+        exit(1)
+else:
+    # Worker process: don't print status, but still need cpu_func/mem_func/time_func
+    # defined since rules reference them. Fall back to safe defaults on failure.
+    try:
+        calculator = ResourceCalculator("config/resources.yaml", config)
+        cpu_func, mem_func, time_func = create_resource_functions(calculator)
+    except Exception:
+        cpu_func = lambda x: 4
+        mem_func = lambda x: 8000
+        time_func = lambda x: 60
+
+
+# -------------------------------------------------------------------------------
+# SAMPLES CONFIG LOADING
+# -------------------------------------------------------------------------------
+
+# --- YAML processing ---
+def process_yaml_for_downloads(yaml_data: dict, out_folder: Path) -> tuple:
+    """
+    Process YAML to detect downloads needed and update paths.
+    DEDUPLICATES reads by storing them at a centralized reads/ folder (sample-centric, not species-centric).
+    This allows the same reads to be used with multiple assemblies without re-downloading.
+    Returns: (updated_yaml, download_manifest)
+    """
+    updated_yaml = copy.deepcopy(yaml_data)
+    download_manifest = []
+
+    # Track what we've already queued to avoid duplicates
+    # Key format varies by type - reads are keyed by sample_id only (species-independent)
+    queued_downloads = {}
+
+    for sp_name, sp_data in yaml_data.get("sp_name", {}).items():
+        if not sp_data or "asm_id" not in sp_data:
+            continue
+
+        for asm_id, asm_data in sp_data["asm_id"].items():
+            if not asm_data:
+                continue
+
+            # -----------------------------------------------------------------
+            # Process assembly file (species-specific - stays in species folder)
+            # -----------------------------------------------------------------
+            asm_file = asm_data.get("asm_file")
+            if asm_file and not is_existing_path(asm_file):
+                if is_url(asm_file):
+                    filename = extract_filename_from_url(asm_file)
+                    # Assemblies go to species/assemblies/ folder (species-specific)
+                    local_path = out_folder / "downloaded_data" / "assemblies" / sp_name / filename
+
+                    dedup_key = ("assembly", asm_file, sp_name)
+                    if dedup_key not in queued_downloads:
+                        download_manifest.append({
+                            "type": "assembly",
+                            "source": asm_file,
+                            "destination": str(local_path),
+                            "method": "curl",
+                            "species": sp_name,
+                            "assembly": asm_id
+                        })
+                        queued_downloads[dedup_key] = str(local_path)
+                        if IS_MAIN: print(f"[GABi] Assembly download queued: {asm_file}")
+                    else:
+                        local_path = Path(queued_downloads[dedup_key])
+
+                    updated_yaml["sp_name"][sp_name]["asm_id"][asm_id]["asm_file"] = str(local_path)
+
+                elif is_ncbi_assembly_accession(asm_file):
+                    filename = f"{asm_file}_genomic.fna.gz"
+                    # Assemblies go to species/assemblies/ folder (species-specific)
+                    local_path = out_folder / "downloaded_data" / "assemblies" / sp_name / filename
+
+                    dedup_key = ("assembly", asm_file, sp_name)
+                    if dedup_key not in queued_downloads:
+                        download_manifest.append({
+                            "type": "assembly",
+                            "source": asm_file,
+                            "destination": str(local_path),
+                            "method": "ncbi_assembly",
+                            "species": sp_name,
+                            "assembly": asm_id
+                        })
+                        queued_downloads[dedup_key] = str(local_path)
+                        if IS_MAIN: print(f"[GABi] Assembly download queued: {asm_file}")
+                    else:
+                        local_path = Path(queued_downloads[dedup_key])
+
+                    updated_yaml["sp_name"][sp_name]["asm_id"][asm_id]["asm_file"] = str(local_path)
+
+            # -----------------------------------------------------------------
+            # Process sample reads - CENTRALIZED at reads/sample_id/read_type
+            # Species-independent! Same reads can be used with multiple assemblies
+            # -----------------------------------------------------------------
+            if "sample_id" not in asm_data:
+                continue
+
+            for sample_id, sample_data in asm_data["sample_id"].items():
+                if not sample_data or "read_type" not in sample_data:
+                    continue
+
+                for read_type, rt_data in sample_data["read_type"].items():
+                    if read_type == "None" or not rt_data:
+                        continue
+
+                    read_files = rt_data.get("read_files", {})
+                    if not read_files:
+                        continue
+
+                    # Normalise BEFORE deciding paired-ness. This tested the
+                    # raw table value, so every alias GABi advertises -
+                    # paired-end, PE, short_reads, or Illumina with a capital
+                    # I on a case-sensitive comparison - fell through to the
+                    # single-end branch: an SRA accession then downloaded as
+                    # {ACC}.fastq.gz instead of {ACC}_1/_2.fastq.gz, leaving
+                    # one path where the PE branch demands two.
+                    rt_norm = normalize_read_type(read_type) or read_type
+                    is_paired = rt_norm in ("illumina", "10x")
+
+                    for path_key, path_value in read_files.items():
+                        if not path_value or path_value == "None":
+                            continue
+
+                        # Handle existing comma-separated paired reads
+                        if isinstance(path_value, str) and "," in path_value:
+                            paths = [p.strip() for p in path_value.split(",")]
+                        elif isinstance(path_value, list):
+                            paths = path_value
+                        else:
+                            paths = [path_value]
+
+                        new_paths = []
+
+                        for path in paths:
+                            if is_existing_path(path):
+                                new_paths.append(path)
+                                continue
+
+                            # -------------------------------------------------------
+                            # CENTRALIZED PATH: reads/sample_id/read_type/
+                            # Species-independent - same reads work with any assembly!
+                            # -------------------------------------------------------
+                            # Normalised here too: with the raw value, rows
+                            # saying "Illumina" and "illumina" created two
+                            # directories for one technology.
+                            base_dir = out_folder / "downloaded_data" / "reads" / sample_id / rt_norm
+
+                            if is_url(path):
+                                filename = extract_filename_from_url(path)
+                                local_path = base_dir / filename
+
+                                # Dedup key: sample + read_type + URL (no species!)
+                                dedup_key = ("reads_url", path, sample_id, rt_norm)
+                                if dedup_key not in queued_downloads:
+                                    download_manifest.append({
+                                        "type": "reads",
+                                        "source": path,
+                                        "destination": str(local_path),
+                                        "method": "curl",
+                                        "sample": sample_id,
+                                        "read_type": rt_norm
+                                    })
+                                    queued_downloads[dedup_key] = str(local_path)
+                                    if IS_MAIN: print(f"[GABi] Reads download queued: {path}")
+                                else:
+                                    local_path = Path(queued_downloads[dedup_key])
+
+                                new_paths.append(str(local_path))
+
+                            elif is_sra_accession(path):
+                                # Dedup key: sample + read_type + SRA accession (no species!)
+                                dedup_key = ("reads_sra", path, sample_id, rt_norm)
+
+                                if is_paired:
+                                    # Paired-end reads
+                                    local_r1 = base_dir / f"{path}_1.fastq.gz"
+                                    local_r2 = base_dir / f"{path}_2.fastq.gz"
+
+                                    if dedup_key not in queued_downloads:
+                                        download_manifest.append({
+                                            "type": "reads",
+                                            "source": path,
+                                            "destination": str(base_dir / path),  # Base path for enaDataGet
+                                            "method": "enaDataGet",
+                                            "paired": True,
+                                            "sample": sample_id,
+                                            "read_type": rt_norm
+                                        })
+                                        queued_downloads[dedup_key] = (str(local_r1), str(local_r2))
+                                        if IS_MAIN: print(f"[GABi] SRA paired reads queued: {path}")
+                                    else:
+                                        local_r1, local_r2 = queued_downloads[dedup_key]
+
+                                    new_paths.extend([str(local_r1), str(local_r2)])
+                                else:
+                                    # Single-end long reads
+                                    local_path = base_dir / f"{path}.fastq.gz"
+
+                                    if dedup_key not in queued_downloads:
+                                        download_manifest.append({
+                                            "type": "reads",
+                                            "source": path,
+                                            "destination": str(local_path),
+                                            "method": "enaDataGet",
+                                            "paired": False,
+                                            "sample": sample_id,
+                                            "read_type": rt_norm
+                                        })
+                                        queued_downloads[dedup_key] = str(local_path)
+                                        if IS_MAIN: print(f"[GABi] SRA reads queued: {path}")
+                                    else:
+                                        local_path = Path(queued_downloads[dedup_key])
+
+                                    new_paths.append(str(local_path))
+
+                        # Update YAML with new paths
+                        if new_paths:
+                            if len(new_paths) == 1:
+                                updated_yaml["sp_name"][sp_name]["asm_id"][asm_id]["sample_id"][sample_id]["read_type"][read_type]["read_files"][path_key] = new_paths[0]
+                            else:
+                                # Paired reads - store as comma-separated string
+                                updated_yaml["sp_name"][sp_name]["asm_id"][asm_id]["sample_id"][sample_id]["read_type"][read_type]["read_files"][path_key] = ", ".join(new_paths)
+
+    # -----------------------------------------------------------------
+    # Print deduplication summary
+    # -----------------------------------------------------------------
+    asm_downloads = len([k for k in queued_downloads if k[0] == "assembly"])
+    reads_downloads = len([k for k in queued_downloads if k[0].startswith("reads")])
+
+    # Count how many manifest entries we would have had without dedup
+    total_asm_refs = sum(
+        1 for sp_data in yaml_data.get("sp_name", {}).values()
+        if sp_data and "asm_id" in sp_data
+        for asm_data in sp_data["asm_id"].values()
+        if asm_data and asm_data.get("asm_file") and not is_existing_path(asm_data.get("asm_file", ""))
+    )
+
+    if asm_downloads < total_asm_refs:
+        if IS_MAIN: print(f"[GABi] Assembly deduplication: {total_asm_refs} references -> {asm_downloads} unique downloads")
+    if reads_downloads > 0:
+        if IS_MAIN: print(f"[GABi] Download manifest: {asm_downloads} assemblies, {reads_downloads} read sets (deduplicated)")
+    return updated_yaml, download_manifest
+
+# --- Loader ---
+def load_samples_config():
+    """Safely load the samples configuration with error handling"""
+
+    # Check if YAML already exists and is recent
+    if yaml_output.exists():
+        yaml_mtime = yaml_output.stat().st_mtime
+        csv_mtime = input_table.stat().st_mtime
+
+        # If YAML is newer than CSV, just load it
+        if yaml_mtime > csv_mtime:
+            try:
+                with yaml_output.open() as f:
+                    config_data = yaml.safe_load(f)
+                if config_data and "sp_name" in config_data:
+                    return config_data
+            except:
+                pass  # Fall through to regeneration
+
+    # Generate fresh YAML data table
+    if IS_MAIN: print("(U ᵔﻌᵔ)っ  Generating YAML data table from input...")
+    result = subprocess.run(
+        ["nomnom",
+         "-a",
+         str(scripts_dir / "GABi_table.attributes"),
+         "-o",
+         str(yaml_output),
+         "--discover-paths",
+         str(input_table)],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        print("(U ಥ ﻌ ಥ)  Error generating YAML configuration:")
+        print(result.stdout if result.stdout else "")
+        print(result.stderr if result.stderr else "")
+        sys.exit(1)
+
+    # Load the generated YAML data table
+    with yaml_output.open() as f:
+        config_data = yaml.safe_load(f)
+
+    if not config_data or "sp_name" not in config_data:
+        print(f"❌ Error: Invalid YAML structure in {yaml_output}")
+        sys.exit(1)
+
+    # Process for downloads
+    if IS_MAIN: print("[GABi] Scanning for URLs and accessions...")
+    updated_yaml, download_manifest = process_yaml_for_downloads(config_data, out_folder)
+
+    if download_manifest:
+        # Save download manifest
+        manifest_path = out_folder / "download_manifest.json"
+        with manifest_path.open('w') as f:
+            json.dump(download_manifest, f, indent=2)
+        if IS_MAIN: print(f"[GABi] Download manifest created: {manifest_path}")
+        if IS_MAIN: print(f"[GABi] Total downloads queued: {len(download_manifest)}")
+        # Save updated YAML
+        with yaml_output.open('w') as f:
+            yaml.dump(updated_yaml, f, default_flow_style=False, sort_keys=False)
+        if IS_MAIN: print(f"[GABi] YAML updated with local paths")
+        return updated_yaml
+    else:
+        if IS_MAIN: print("[GABi] No downloads needed - all data is local")
+        return config_data
+
+# --- Run the loader ---
+if IS_MAIN: print(f"(∪≖ﻌ≖∪)  NomNom is handling the data table...")
+
+samples_config = load_samples_config()
+from sex_helpers import (
+    validate_sex_config,
+    get_sex_chr,
+    get_sample_sex,
+    is_heterogametic,
+    is_homogametic,
+    resolve_haploid_contigs,
+)
+validate_sex_config(samples_config, is_main=IS_MAIN)
+
+# -------------------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------------------
+
+# --- Sample data extraction ---
+
+def get_assembly_path(species, assembly):
+    return samples_config["sp_name"][species]["asm_id"][assembly]["asm_file"]
+
+_NODE_LOOKUP_MISSES = set()
+_NODE_LOOKUP_MISS_LIMIT = 5
+
+
+def _report_node_lookup_miss(exc, species, assembly, sample_id, read_type_key):
+    """Diagnostic for what _get_sample_node()'s blanket except is hiding."""
+    key = (type(exc).__name__, species, assembly, sample_id, read_type_key)
+    if key in _NODE_LOOKUP_MISSES:
+        return
+    _NODE_LOOKUP_MISSES.add(key)
+    if not IS_MAIN or len(_NODE_LOOKUP_MISSES) > _NODE_LOOKUP_MISS_LIMIT:
+        return
+    if len(_NODE_LOOKUP_MISSES) == _NODE_LOOKUP_MISS_LIMIT:
+        print("[GABi] NOTE: further config-lookup misses suppressed.")
+        return
+    print(
+        f"[GABi] NOTE: config lookup found nothing for "
+        f"{species}/{assembly}/{sample_id} ({read_type_key}) - "
+        f"{type(exc).__name__}: {exc}"
+    )
+
+
+def _get_sample_node(species, assembly, sample_id, read_type_key=None):
+    """Extract sample data from config"""
+    try:
+        node = samples_config["sp_name"][species]["asm_id"][assembly]["sample_id"][sample_id]
+
+        if not node.get("read_type") or node["read_type"] == {"None": {}}:
+            return None, False, {}
+
+        # Simplified - just get reads, no trim_qc logic
+        if read_type_key:
+            target_norm = normalize_read_type(read_type_key)
+            actual_key = None
+            for yaml_key in node["read_type"]:
+                if normalize_read_type(yaml_key) == target_norm:
+                    actual_key = yaml_key
+                    break
+
+            if not actual_key:
+                return None, False, {}
+
+            sub = node["read_type"][actual_key]
+            reads = sub.get("read_files", {}) or {}
+            reads = {k: v for k, v in reads.items()
+                    if v not in [None, "None"] and k.startswith("Path")}
+
+            # Determine trim flag based on read type
+            is_pe = target_norm in ["illumina", "10x"]
+            is_hifi = target_norm == "hifi"
+
+            if is_pe:
+                trim = _as_bool(config.get("TRIM_PE", True))
+            elif is_hifi:
+                trim = _as_bool(config.get("FILTER_HIFI", False))
+            else:
+                trim = False
+
+            return target_norm, trim, reads
+
+        # Otherwise return first (for backward compatibility)
+        rt = next(iter(node["read_type"]))
+        if rt == "None" or rt is None:
+            return None, False, {}
+
+        sub = node["read_type"][rt]
+        reads = sub.get("read_files", {}) or {}
+        reads = {k: v for k, v in reads.items()
+                if v not in [None, "None"] and k.startswith("Path")}
+
+        rt_norm = normalize_read_type(rt)
+        is_pe = rt_norm in ["illumina", "10x"]
+        trim = _as_bool(config.get("TRIM_PE", True)) if is_pe else False
+
+        return rt_norm, trim, reads
+
+    except (KeyError, TypeError, AttributeError) as e:
+        # Behaviour unchanged: absence is normal control flow here, several
+        # callers probe with keys that may not exist, and they wrap this in
+        # blanket excepts of their own. But the same except also swallows a
+        # malformed YAML node (a None where a dict belongs), so it is worth
+        # knowing whether it ever fires in a real run - and with what - before
+        # narrowing it. Reported once per distinct cause, then suppressed.
+        _report_node_lookup_miss(e, species, assembly, sample_id, read_type_key)
+        return None, False, {}
+
+def _normalize_pe(val, where=""):
+    """Parse a paired-end read_files cell into exactly two paths.
+
+    Splits on EVERY comma and checks parity. Splitting on the first comma only
+    made a four-path cell yield r2 = "b.fq.gz, c.fq.gz, d.fq.gz" - a path that
+    cannot exist, discovered when the job ran rather than when the DAG was
+    built. A short cell is equally an error: GABi processes short reads as
+    pairs, so a single-file illumina/10x entry is a mis-entered table, not
+    single-end data.
+    """
+    if isinstance(val, list):
+        parts = [str(x).strip() for x in val]
+    else:
+        parts = [x.strip() for x in str(val).split(",")]
+    parts = [p for p in parts if p and p != "None"]
+
+    if len(parts) != 2:
+        loc = f"{where}: " if where else ""
+        raise ValueError(
+            f"[GABi] {loc}a paired-end entry must list exactly two files, "
+            f"got {len(parts)}: {val!r}"
+        )
+    return parts[0], parts[1]
+
+# --- Pre-aligned (BAM) input -------------------------------------------------
+# GABi can be entered either from reads or from an already-aligned BAM. The
+# technology stays declared in read_type (illumina / ont / hifi) exactly as for
+# FASTQ - only the file extension says "mapping is already done". Nothing about
+# the technology is inferred from the BAM; D02_import_bam reads its header purely
+# to CHECK the declaration, the same way D06 cross-checks a declared karyotype
+# against coverage.
+
+def _is_bam_path(value):
+    """True if a read_files value points at a single BAM."""
+    if isinstance(value, list):
+        return len(value) == 1 and str(value[0]).strip().lower().endswith(".bam")
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    return "," not in v and v.lower().endswith(".bam")
+
+
+def _read_paths(reads):
+    """Flatten a read_files dict into individual paths."""
+    out = []
+    for v in (reads or {}).values():
+        if isinstance(v, list):
+            out.extend(str(x).strip() for x in v)
+        elif isinstance(v, str):
+            out.extend(x.strip() for x in v.split(","))
+        else:
+            out.append(str(v).strip())
+    return [p for p in out if p]
+
+
+def bam_entry_path(sp, asm, sid, rt_key):
+    """The single pre-aligned BAM for this sample/read_type, or None.
+
+    Raises when the declaration is one GABi cannot honour, rather than silently
+    treating a half-BAM entry as reads.
+    """
+    _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+    if not reads:
+        return None
+    paths = _read_paths(reads)
+    bams = [p for p in paths if p.lower().endswith(".bam")]
+    if not bams:
+        return None
+    if len(bams) != len(paths):
+        raise ValueError(
+            f"[GABi] {sid} ({rt_key}): read_files mixes BAM and FASTQ entries.\n"
+            f"       A pre-aligned sample must provide exactly one BAM."
+        )
+    if len(bams) > 1:
+        raise ValueError(
+            f"[GABi] {sid} ({rt_key}): {len(bams)} BAMs provided.\n"
+            f"       GABi expects exactly one BAM per sample - merge them first."
+        )
+    return bams[0]
+
+
+def is_bam_entry(sp, asm, sid, rt_key):
+    return bam_entry_path(sp, asm, sid, rt_key) is not None
+
+
+def sample_is_bam_entry(sp, asm, sid):
+    """True if this sample is entered as a pre-aligned BAM.
+
+    A BAM sample must be BAM-only: mixing a FASTQ technology with a BAM
+    technology would leave module B producing read QC for part of the sample,
+    and a per-sample MultiQC report covering only some of its data.
+    """
+    try:
+        sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+        rt_keys = [k for k in sample_data.get("read_type", {}) if k not in ("None", None)]
+    except (KeyError, TypeError, AttributeError):
+        return False
+    flags = [is_bam_entry(sp, asm, sid, k) for k in rt_keys]
+    if any(flags) and not all(flags):
+        mixed = ", ".join(k for k, f in zip(rt_keys, flags) if not f)
+        raise ValueError(
+            f"[GABi] {sid}: pre-aligned BAM input cannot be mixed with read input.\n"
+            f"       This sample provides a BAM for one technology and reads for: {mixed}\n"
+            f"       Use either reads or a BAM for the whole sample."
+        )
+    return bool(flags) and all(flags)
+
+
+def _enumerate_groups(rt, reads_dict, ctx=""):
+    """Generate read groups with consistent numbering.
+
+    ctx is an optional "species/assembly/sample" string used only to locate a
+    bad entry in an error message; DAG-time callers leave it empty.
+    """
+    if not reads_dict:
+        return
+
+    # Sort by Path number if possible
+    def sort_key(k):
+        if k.startswith("Path"):
+            try:
+                return int(k[4:])  # Extract number from "Path1", "Path2", etc.
+            except ValueError:
+                pass
+        return k
+
+    for key in sorted(reads_dict.keys(), key=sort_key):
+        val = reads_dict[key]
+
+        # idx comes from the Path key itself, never from a running counter.
+        # Callers filter out None cells before getting here, so a missing
+        # middle entry (NomNom writes None for a missing value) leaves a gap:
+        # with a counter, Path3 would silently become 2 and every FASTQ,
+        # report and BAM derived from it would change name.
+        if not (key.startswith("Path") and key[4:].isdigit()):
+            raise ValueError(
+                f"[GABi] read_files key {key!r} is not of the form 'PathN'. "
+                f"Read entries are numbered by their Path key, so it must be."
+            )
+        i = int(key[4:])
+
+        # Pre-aligned input: a .bam in read_files means trimming and mapping
+        # have already happened, so this entry has no read groups. Yielding
+        # nothing is deliberate - _enumerate_groups feeds eight call sites
+        # (four in B_trim_reads.smk), and every one of them should produce no
+        # FASTQ-derived output for such a sample. The BAM itself is picked up by
+        # bam_entry_path() and D02_import_bam instead.
+        if _is_bam_path(val):
+            continue
+
+        if _is_long(rt):
+            # Single/long read
+            r = val if isinstance(val, str) else (val[0] if isinstance(val, list) else str(val))
+            base = _strip_ext(r)
+            yield {"idx": i, "rt": rt, "kind": "long", "r": r, "base": base}
+        else:
+            # Paired-end read
+            # No try/except here on purpose. It used to downgrade a bad PE
+            # entry to print("Warning: ...") + continue, which produced a read
+            # group that silently vanished: no output, no error, a sample
+            # quietly smaller than the table says.
+            where = f"{ctx}/{rt}/{key}" if ctx else f"{rt}/{key}"
+            r1, r2 = _normalize_pe(val, where=where)
+            base = _pe_base(r1, r2)
+
+            # Name-based mate cross-check. Without it R2's name is never
+            # looked at and a row pairing sampleA_1.fq.gz with
+            # sampleB_2.fq.gz is accepted, processed, and produces a
+            # plausible-looking result.
+            # It warns rather than raises: naming schemes exist that these
+            # rules cannot parse, and a hard failure would block valid
+            # data. It compares names, not contents - a genuinely
+            # mismatched pair that is named consistently still passes.
+            if not _mates_look_paired(r1, r2) and (r1, r2) not in _MATE_WARNED:
+                _MATE_WARNED.add((r1, r2))
+                if IS_MAIN:
+                    s1 = _read_stem(r1, strip_mate=True)
+                    s2 = _read_stem(r2, strip_mate=True)
+                    print(
+                        f"[GABi] WARNING: {where}: R1 and R2 do not look like mates.\n"
+                        f"        R1: {r1}\n"
+                        f"        R2: {r2}\n"
+                        f"        stems: {s1!r} vs {s2!r}\n"
+                        f"        Check the read_files cell - the files are used as declared."
+                    )
+
+            yield {"idx": i, "rt": rt, "kind": "pe", "r1": r1, "r2": r2, "base": base}
+
+
+# GABi_TEST_HELPERS_BEGIN
+# samples_config does not change after load, and _collect_sample_reads() is
+# called from input functions for every job during DAG construction. It used
+# to stop at the first assembly containing the sample; now it always walks the
+# whole config, so without this the cost grows with the number of assemblies
+# on every call.
+_SAMPLE_READS_CACHE = {}
+# GABi_TEST_HELPERS_END
+
+
+def _collect_sample_reads(sample_id, read_type_key=None):
+    """Read entries for a sample, collected across EVERY assembly it appears in.
+
+    Returns {normalized_read_type: reads_dict}, or the single entry matching
+    read_type_key when one is given.
+
+    The whole point of the sample_id column is that one sample recurs across
+    assemblies - that is what makes the layout sample-centric, and why module B
+    processes a sample's reads once. Taking the first (species, assembly) node
+    that happened to contain the sample meant that when two rows for the same
+    sample_id AND read_type carried different read_files, one silently won, and
+    which one depended on dict iteration order.
+
+    Same sample + same technology + different files is a config error and is
+    raised, naming both assemblies. A sample declaring DIFFERENT technologies
+    under different assemblies is legitimate and is collected normally.
+    """
+    target = normalize_read_type(read_type_key) if read_type_key else None
+    cache_key = (sample_id, target)
+    cached = _SAMPLE_READS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    found = {}      # rt_norm -> reads_dict
+    origin = {}     # rt_norm -> "species/assembly" that first declared it
+
+    for sp_name, sp_data in (samples_config.get("sp_name") or {}).items():
+        if not sp_data or "asm_id" not in sp_data:
+            continue
+        for asm_id, asm_data in (sp_data["asm_id"] or {}).items():
+            if not asm_data or "sample_id" not in asm_data:
+                continue
+            if sample_id not in (asm_data["sample_id"] or {}):
+                continue
+            node = asm_data["sample_id"][sample_id]
+            if not node or not node.get("read_type"):
+                continue
+
+            for yaml_key, sub in node["read_type"].items():
+                if yaml_key in (None, "None") or not sub:
+                    continue
+                rt_norm = normalize_read_type(yaml_key)
+                if rt_norm is None or (target is not None and rt_norm != target):
+                    continue
+
+                reads = sub.get("read_files", {}) or {}
+                reads = {k: v for k, v in reads.items()
+                         if v not in [None, "None"] and k.startswith("Path")}
+                if not reads:
+                    continue
+
+                here = f"{sp_name}/{asm_id}"
+                if rt_norm in found and found[rt_norm] != reads:
+                    raise ValueError(
+                        f"[GABi] {sample_id} ({rt_norm}): the same sample and technology "
+                        f"declares different read_files under two assemblies.\n"
+                        f"       {origin[rt_norm]}: {found[rt_norm]}\n"
+                        f"       {here}: {reads}\n"
+                        f"       GABi processes a sample's reads once, so the two rows "
+                        f"must agree."
+                    )
+                found.setdefault(rt_norm, reads)
+                origin.setdefault(rt_norm, here)
+
+    # Only successful walks are cached; a divergent table raises every time.
+    _SAMPLE_READS_CACHE[cache_key] = found
+    return found
+
+
+# Every flag the code reads as a yes/no. Checked once at load so a typo is
+# reported next to the table's own problems instead of quietly meaning "off".
+# GABi_TEST_HELPERS_BEGIN
+# Suffixes GABi appends to mark its own processed files. Module B's link and
+# compress rules exclude them from the `base` wildcard, so a SOURCE file whose
+# name already ends in one cannot be bound by any producer - the run dies with
+# a MissingInputException that says nothing about the cause.
+#   long reads: B00/B01_link/compress_long_reads, B03, B05, B07
+#   paired end: B00/B01_link/compress_pe_reads (B02, the trimming path, does
+#               not constrain base, so a *_trimmed_R1.fq.gz source is only a
+#               problem when TRIM_PE is off)
+_RESERVED_BASE_SUFFIXES = {
+    "long": ("_corrected", "_filtered"),
+    "pe": ("_trimmed",),
+}
+# GABi_TEST_HELPERS_END
+
+
+# GABi_TEST_HELPERS_BEGIN
+# JOINT_GENO is deliberately absent: it is off/merge/multi, not a flag.
+_BOOL_FLAGS = (
+    "CORRECT_ONT",
+    "DEDUP_LONG",
+    "DEDUP_PE",
+    "FILTER_HIFI",
+    "KEEP_RAW_BCF",
+    "KEEP_RAW_JOINT",
+    "KEEP_gVCF",
+    "READS_MAPPING",
+    "RUN_CALLING",
+    "RUN_COMPL",
+    "RUN_PSMC",
+    "RUN_ROCO",
+    "RUN_TAGGING",
+    "TRIM_PE",
+)
+# GABi_TEST_HELPERS_END
+
+
+def validate_samples_config():
+    """Check the whole table once, before anything is scheduled.
+
+    Every problem here used to surface later and further away: an unrecognised
+    read type as a MissingInputException on a directory no rule can build, a
+    mis-entered read_files cell as a job failing on a path that cannot exist,
+    or - worse - as nothing at all. Collect them and report them together, so
+    one pass over the table fixes them all.
+    """
+    problems = []
+    bad_read_types = []
+
+    for flag in _BOOL_FLAGS:
+        if flag not in config:
+            continue
+        value = config[flag]
+        if value is None:
+            # 'TRIM_PE:' with nothing after it. config.get() returns None
+            # because the key exists, so the default in the call site never
+            # applies and the flag reads as off - the opposite of TRIM_PE's
+            # documented default. Ask rather than guess.
+            problems.append(
+                f"  {flag}: has no value. An empty setting reads as 'off', "
+                f"which is rarely what was meant - write on or off."
+            )
+            continue
+        try:
+            _as_bool(value)
+        except ValueError as e:
+            problems.append(f"  {flag}: {str(e).replace('[GABi] ', '')}")
+
+    for sp_name, sp_data in (samples_config.get("sp_name") or {}).items():
+        if not sp_data or "asm_id" not in sp_data:
+            continue
+        for asm_id, asm_data in (sp_data["asm_id"] or {}).items():
+            if not asm_data or "sample_id" not in asm_data:
+                continue
+            for sid, node in (asm_data["sample_id"] or {}).items():
+                if not node or not node.get("read_type"):
+                    continue
+                for yaml_key, sub in node["read_type"].items():
+                    if yaml_key in (None, "None") or not sub:
+                        continue
+                    ctx = f"{sp_name}/{asm_id}/{sid}"
+
+                    why = read_type_problem(yaml_key)
+                    if why:
+                        problems.append(
+                            f"  {ctx}: read_type {yaml_key!r} - {why}"
+                        )
+                        bad_read_types.append(yaml_key)
+                        continue
+
+                    reads = sub.get("read_files", {}) or {}
+                    reads = {k: v for k, v in reads.items()
+                             if v not in [None, "None"] and k.startswith("Path")}
+                    try:
+                        groups = list(_enumerate_groups(
+                            normalize_read_type(yaml_key), reads, ctx=ctx))
+                    except ValueError as e:
+                        problems.append("  " + str(e).replace("[GABi] ", "").replace("\n", "\n  "))
+                        continue
+
+                    for grp in groups:
+                        reserved = [
+                            sfx for sfx in _RESERVED_BASE_SUFFIXES.get(grp["kind"], ())
+                            if grp["base"].endswith(sfx)
+                        ]
+                        if not reserved:
+                            continue
+                        if grp["kind"] == "pe" and _as_bool(config.get("TRIM_PE", True)):
+                            # B02 takes it; only the link/compress path refuses.
+                            continue
+                        src = grp.get("r") or grp.get("r1")
+                        problems.append(
+                            f"  {ctx}/Path{grp['idx']}: {os.path.basename(src)} ends in "
+                            f"{reserved[0]!r}, which GABi reserves for the files it "
+                            f"produces itself.\n"
+                            f"       No rule can take a source file with that suffix. "
+                            f"Rename it (or symlink it under another name)."
+                        )
+
+    # Divergence between assemblies, checked once per sample.
+    seen = set()
+    for sp_data in (samples_config.get("sp_name") or {}).values():
+        if not sp_data or "asm_id" not in sp_data:
+            continue
+        for asm_data in (sp_data["asm_id"] or {}).values():
+            if not asm_data or "sample_id" not in asm_data:
+                continue
+            for sid in (asm_data["sample_id"] or {}):
+                if sid in seen or sid in (None, "None"):
+                    continue
+                seen.add(sid)
+                try:
+                    _collect_sample_reads(sid)
+                except ValueError as e:
+                    problems.append("  " + str(e).replace("[GABi] ", "").replace("\n", "\n  "))
+
+    if problems:
+        message = ("(U ಥ ﻌ ಥ)  GABi cannot run with this data table:\n\n"
+                   + "\n".join(problems))
+        if bad_read_types:
+            message += ("\n\n       Accepted read_type spellings "
+                        "(case, spaces, - and _ are ignored):\n"
+                        + accepted_read_types())
+        raise ValueError(message)
+
+    if IS_MAIN:
+        print(f"[GABi] Data table validated: {len(seen)} sample(s)")
+
+
+# Reported the way validate_sex_config() reports: a config error is the user's
+# to fix, not a traceback to read.
+try:
+    validate_samples_config()
+except ValueError as _e:
+    print(str(_e))
+    sys.exit(1)
+
+# --- Technology helpers (single source of truth) ---
+# These live here rather than in D_map_reads.smk / E_variant_call.smk because
+# both modules need them, and `include:` happens after this point so every rule
+# file sees them. D and E previously each carried their own copy of the priority
+# logic, with a comment in D06 asking that the two be kept in sync by hand.
+
+# Read technologies that are never mapped and never used for variant calling.
+# Hi-C is assembly/scaffolding data: normalize_read_type() recognises it, but no
+# mapping rule accepts it (D02_map_pe_reads is constrained to illumina|10x and
+# D02_map_long_reads to hifi|ont), so it has to be filtered out before it can
+# reach the DAG.
+# NOT APPLIED YET - callable_techs() is unused until the selection phase.
+NON_CALLABLE_TECHS = {"hic"}
+
+# Which read technologies each variant caller can be used with.
+#   deep - DeepVariant: WGS / PACBIO / ONT_R104 models cover every tech
+#   bcft - bcftools:    mpileup has an -X profile for every tech we support
+#   gatk - HaplotypeCaller: short reads, plus HiFi (discouraged). Never ONT.
+# NOT APPLIED YET - consumed by the validation gate and selection phases.
+CALLER_TECHS = {
+    "deep": {"illumina", "10x", "hifi", "ont"},
+    "bcft": {"illumina", "10x", "hifi", "ont"},
+    "gatk": {"illumina", "10x", "hifi"},
+}
+
+# Accepted CALLER spellings -> canonical key. The input is lowercased first, so
+# a single entry covers every capitalisation ("deepvariant" also matches
+# "DeepVariant", "Deepvariant", "DEEPVARIANT", ...).
+# NOT APPLIED YET - normalize_caller() is unused until the config phase.
+_CALLER_ALIASES = {
+    "deep": "deep", "deepvariant": "deep", "dv": "deep",
+    "bcft": "bcft", "bcftools": "bcft", "bcf": "bcft",
+    "gatk": "gatk", "haplotypecaller": "gatk", "hc": "gatk",
+}
+
+
+def normalize_caller(value, default="deep"):
+    """Map a CALLER config value onto its canonical key: deep / bcft / gatk."""
+    raw = str(value if value is not None else default).strip().lower()
+    if raw not in _CALLER_ALIASES:
+        raise ValueError(
+            f"[GABi] Invalid CALLER: {value!r}. Accepted values are (case-insensitive): "
+            f"{', '.join(sorted(set(_CALLER_ALIASES)))}"
+        )
+    return _CALLER_ALIASES[raw]
+
+
+def priority_list():
+    """DATA_PRIORITY parsed into an ordered list of normalized tech names."""
+    raw = str(config.get("DATA_PRIORITY", "hifi>illumina>ont"))
+    return [x.strip().lower() for x in re.split(r"[>\s,]+", raw) if x.strip()]
+
+
+def sample_techs(sp, asm, sid):
+    """Normalized read types that actually have read files for this sample.
+
+    Raw enumeration: does NOT filter NON_CALLABLE_TECHS. Use callable_techs()
+    for anything that feeds mapping, tech selection or variant calling.
+    """
+    try:
+        sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+        techs = []
+        for rt_key in sample_data.get("read_type", {}):
+            if rt_key in ("None", None):
+                continue
+            rt_norm = normalize_read_type(rt_key)
+            _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+            if reads:
+                techs.append(rt_norm)
+        return techs
+    except (KeyError, TypeError, AttributeError):
+        return []
+
+
+def callable_techs(sp, asm, sid, caller=None):
+    """sample_techs() minus non-callable techs, and minus techs the given
+    caller cannot handle. Order follows the data table, not DATA_PRIORITY."""
+    techs = [t for t in sample_techs(sp, asm, sid) if t not in NON_CALLABLE_TECHS]
+    if caller is not None:
+        allowed = CALLER_TECHS[normalize_caller(caller)]
+        techs = [t for t in techs if t in allowed]
+    return techs
+
+
+def parse_joint_geno(value):
+    """JOINT_GENO -> 'off' | 'merge' | 'multi'.
+
+    Lives here, next to normalize_caller(), because BOTH the Snakefile's output
+    collector and E_variant_call.smk have to agree on what the setting means.
+    They previously did not: the collector tested it with _as_bool(), which only
+    recognises on/true/yes/1, so 'merge' and 'multi' evaluated to False and no
+    joint outputs were ever requested - while E happily reported joint
+    genotyping as enabled. Nothing failed; the files simply never appeared.
+
+    YAML turns an unquoted off/on into False/True, so both forms are handled.
+    'on' remains a silent alias for 'merge'. 'true'/'yes' cannot be distinct
+    values for the same reason - YAML would collapse them into booleans.
+    """
+    if value is None or value is False:
+        return "off"
+    if value is True:
+        return "merge"
+    s = str(value).strip().lower()
+    aliases = {
+        "off": "off", "false": "off", "no": "off", "0": "off", "none": "off",
+        "merge": "merge", "on": "merge", "true": "merge", "yes": "merge", "1": "merge",
+        "multi": "multi",
+    }
+    if s not in aliases:
+        raise ValueError(
+            f"[GABi] Invalid JOINT_GENO: {value!r}. Expected one of:\n"
+            f"       off   - no joint genotyping\n"
+            f"       merge - combine the per-sample gVCFs (alias: on)\n"
+            f"       multi - call the whole cohort together from BAMs "
+            f"(CALLER: bcft only)"
+        )
+    return aliases[s]
+
+
+def joint_geno_mode():
+    """Configured JOINT_GENO mode, parsed. Use this, never _as_bool().
+
+    parse_joint_geno() takes the RAW value: it is a three-way setting
+    (off/merge/multi), so passing it through _as_bool() first would collapse
+    'merge' and 'multi' to False - the exact bug parse_joint_geno() was
+    written to fix. tests/test_flags.py guards this.
+    """
+    return parse_joint_geno(config.get("JOINT_GENO", False))
+
+
+def caller_eligible_techs():
+    """Technologies the configured CALLER can use, sorted.
+
+    Lives here rather than in E_variant_call.smk because D_map_reads.smk needs
+    it too (to tell the selection script which technologies are candidates) and
+    D is included first, so E's _CALLER is not yet defined when D is parsed.
+    """
+    return sorted(CALLER_TECHS[normalize_caller(config.get("CALLER", "deep"))])
+
+
+def pick_priority_tech(sp, asm, sid, techs=None):
+    """Highest-priority tech for a sample according to DATA_PRIORITY.
+
+    Coverage is NOT consulted - this is DAG-time ordering only. Returns None
+    when the sample has no usable reads. Falls back to the first available
+    tech when none of them appear in DATA_PRIORITY.
+    """
+    if techs is None:
+        techs = sample_techs(sp, asm, sid)
+    if not techs:
+        return None
+    if len(techs) == 1:
+        return techs[0]
+    for prio in priority_list():
+        if prio in techs:
+            return prio
+    return techs[0]
+
+
+# --- Output path generation ---
+#def _reads_outdir(sp, asm, sid):
+#    """Get reads output directory"""
+#    return os.path.join(config["OUT_FOLDER"], "GABi_results", sp, asm, "samples", str(sid), "reads")
+#
+#def _reads_reportdir(sp, asm, sid):
+#    """Get reports output directory"""
+#    return os.path.join(_reads_outdir(sp, asm, sid), "reports")
+
+def _outputs_for_group(sp, asm, sid, grp, trim):
+    """Generate output filenames for a read group (sample-centric)"""
+    data_base = os.path.join(config["OUT_FOLDER"], "GABi_results", "data")
+    rt = grp["rt"]
+    i  = grp["idx"]
+    base = grp["base"]
+
+    if grp["kind"] == "long":
+        if rt == "hifi" and _as_bool(config.get("FILTER_HIFI", False)):
+            name = f"Path{i}_{base}_filtered.fq.gz"
+            return [os.path.join(data_base, sid, rt, "processed", name)]
+        elif rt == "ont" and _as_bool(config.get("CORRECT_ONT", False)):
+            name = f"Path{i}_{base}_corrected.fq.gz"
+            return [os.path.join(data_base, sid, rt, "processed", name)]
+        else:
+            name = f"Path{i}_{base}.fq.gz"
+            return [os.path.join(data_base, sid, rt, name)]
+    else:
+        if trim:
+            subdir = os.path.join(data_base, sid, rt, "processed")
+            r1 = os.path.join(subdir, f"Path{i}_{base}_R1_trimmed.fq.gz")
+            r2 = os.path.join(subdir, f"Path{i}_{base}_R2_trimmed.fq.gz")
+        else:
+            subdir = os.path.join(data_base, sid, rt)
+            r1 = os.path.join(subdir, f"Path{i}_{base}_R1.fq.gz")
+            r2 = os.path.join(subdir, f"Path{i}_{base}_R2.fq.gz")
+        return [r1, r2]
+
+# --- Public interface ---
+#def sample_read_outputs(sp, asm, sid):
+#    """Get all expected output files for a sample (all read types)"""
+#    outs = []
+#    try:
+#        sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+#        if not sample_data.get("read_type"):
+#            return outs
+#        for rt_key in sample_data["read_type"]:
+#            if rt_key == "None" or rt_key is None:
+#                continue
+#            rt, trim, reads = _get_sample_node(sp, asm, sid, rt_key)
+#            if rt and reads:
+#                for grp in _enumerate_groups(rt, reads):
+#                    outs.extend(_outputs_for_group(sp, asm, sid, grp, trim))
+#    except (KeyError, TypeError, AttributeError):
+#        pass
+#    return outs
+#
+#def sample_read_inputs(sp, asm, sid):
+#    """Get all input read files for a sample (all read types)"""
+#    ins = []
+#
+#    try:
+#        sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+#        if not sample_data.get("read_type"):
+#            return ins
+#
+#        # Process each read type for this sample
+#        for rt_key in sample_data["read_type"]:
+#            if rt_key == "None" or rt_key is None:
+#                continue
+#
+#            rt, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+#
+#            if rt and reads:
+#                for grp in _enumerate_groups(rt, reads):
+#                    if grp["kind"] == "long":
+#                        ins.append(grp["r"])
+#                    else:
+#                        ins.extend([grp["r1"], grp["r2"]])
+#    except (KeyError, TypeError, AttributeError):
+#        pass
+#
+#    return ins
+#
+#def resource_key_for_sample(sp, asm, sid):
+#    rt, trim, reads = _get_sample_node(sp, asm, sid)
+#
+#    # Check if this is HiFi with filtering
+#    if rt == "hifi" and _as_bool(config.get("FILTER_HIFI", False)):
+#        return "trim_hifi"
+#
+#    if not trim:
+#        # Check if any files need compression
+#        for grp in _enumerate_groups(rt, reads):
+#            if grp["kind"] == "long" and not grp["r"].endswith('.gz'):
+#                return "compress_reads"  # Needs compression
+#            elif grp["kind"] == "pe":
+#                if not grp["r1"].endswith('.gz') or not grp["r2"].endswith('.gz'):
+#                    return "compress_reads"  # Needs compression
+#        return "light_task"  # Only linking needed
+#
+#    return "trim_long_reads" if _is_long(rt) else "trim_illumina_pe"
+
+def all_samples_iter():
+    """Iterate over all valid samples with read data"""
+    for sp, sd in samples_config["sp_name"].items():
+        if not sd or "asm_id" not in sd:
+            continue
+        for asm, ad in sd["asm_id"].items():
+            if not ad or "sample_id" not in ad:
+                continue
+            for sid in ad["sample_id"]:
+                # Skip None samples
+                if sid == "None" or sid is None:
+                    continue
+                # Check if sample has ANY valid read data (any read type)
+                sample_data = ad["sample_id"][sid]
+                if sample_data.get("read_type"):
+                    has_valid_reads = False
+                    for rt_key in sample_data["read_type"]:
+                        if rt_key != "None":
+                            rt_norm = normalize_read_type(rt_key)
+                            _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                            if reads:  # Only if there are actual read files
+                                has_valid_reads = True
+                                break
+                    if has_valid_reads:
+                        yield sp, asm, sid
+
+# --- BED handling for masking ---
+def get_sibling_bed_path(species, assembly):
+    """
+    Return the path to a sibling BED file located next to the assembly, if one
+    exists. A sibling BED shares the assembly's base name (with .fa/.fasta/.fna
+    and .gz/.bgz stripped) and has extension .bed.gz (preferred) or .bed.
+
+    Examples:
+        /data/genome.fa.gz   -> /data/genome.bed.gz   (preferred)
+                             -> /data/genome.bed      (fallback)
+        /data/genome.fasta   -> /data/genome.bed.gz / .bed
+
+    note: this check runs at DAG-construction time. A BED dropped into the
+    folder after the pipeline has started will NOT be picked up without
+    re-running snakemake.
+
+    Returns the path as a string if found, else None.
+    """
+    asm_path = get_assembly_path(species, assembly)
+    if not asm_path:
+        return None
+
+    base = asm_path
+    for ext in (".gz", ".bgz"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    for ext in (".fa", ".fasta", ".fna"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+
+    for candidate in (base + ".bed.gz", base + ".bed"):
+        if os.path.exists(candidate):
+            return candidate
+
+    return None
+
+# --- VCF resolution handling ---
+_RESOLUTION = str(config.get("RESOLUTION", "block")).strip().lower()
+if _RESOLUTION not in ("block", "basepair"):
+    raise ValueError(
+        f"RESOLUTION must be 'block' or 'basepair', got: '{_RESOLUTION}'"
+    )
+_BP_MODE = (_RESOLUTION == "basepair")
+
+_BP_TAG = ".bp" if _BP_MODE else ""
+
+# -------------------------------------------------------------------------------
+# COLLECTORS
+# -------------------------------------------------------------------------------
+
+# --- Assembly stats ---
+def get_asm_stats_results():
+    expected_files = []
+
+    if not samples_config or "sp_name" not in samples_config:
+        print("❌ Error: samples_config is invalid")
+        return expected_files
+
+    run_compl = _as_bool(config.get("RUN_COMPL", True))
+
+    for species, species_data in samples_config["sp_name"].items():
+        if not species_data or "asm_id" not in species_data:
+            continue
+
+        for assembly, assembly_data in species_data["asm_id"].items():
+            if not assembly_data:
+                continue
+
+            base_path = os.path.join(out_folder, species, assembly, "assembly_stats")
+
+            # gfastats always
+            expected_files.append(
+                os.path.join(base_path, "gfastats", "stats.txt")
+            )
+
+            # compleasm only if enabled
+            if run_compl:
+                expected_files.append(
+                    os.path.join(base_path, "compleasm", "summary.txt")
+                )
+                expected_files.append(
+                    os.path.join(base_path, "compleasm", "compleasm_results.tar.gz")
+                )
+
+            # report always (gfastats-only or gfastats+compleasm)
+            expected_files.append(
+                os.path.join(base_path, f"{assembly}_mini_report.md")
+            )
+
+    return expected_files
+
+# --- Repeat masking ---
+def get_repeat_masking_results():
+    """Get expected output files from repeat masking analysis.
+
+    Behavior is governed by the MASKING control-panel variable:
+      - off/none/empty: no masking outputs
+      - on: full RepeatMasker pipeline
+      - auto: if a sibling BED exists next to the assembly, use it;
+              otherwise extract masked regions from a softmasked assembly
+    """
+    expected_files = []
+
+    mode = str(config.get("MASKING", "off")).strip().lower()
+
+    if mode in ("", "off", "false", "no", "0", "none"):
+        return expected_files
+
+    for species, species_data in samples_config["sp_name"].items():
+        for assembly, assembly_data in species_data["asm_id"].items():
+            base_path = os.path.join(
+                config["OUT_FOLDER"], "GABi_results", species, assembly, "masking"
+            )
+
+            if mode in ("on", "true", "yes", "1"):
+                # Run full RepeatMasker
+                expected_files.extend([
+                    # Main masking outputs (compressed)
+                    os.path.join(base_path, f"{assembly}.masked.fa.gz"),
+                    os.path.join(base_path, f"{assembly}.fa.out.gz"),
+                    os.path.join(base_path, f"{assembly}.fa.out.gff.gz"),
+                    os.path.join(base_path, f"{assembly}.mask_from_rm.bed.gz"),
+                    # Uncompressed files that remain
+                    os.path.join(base_path, f"{assembly}.fa.align"),
+                    os.path.join(base_path, f"{assembly}.fa.tbl"),
+                    # Small landscape analysis outputs (uncompressed)
+                    os.path.join(base_path, f"{assembly}.fa.align.divsum"),
+                    os.path.join(base_path, f"{assembly}.fa.align.divsum.html"),
+                    os.path.join(base_path, f"{assembly}.repeat_landscape.svg"),
+                    os.path.join(base_path, f"{assembly}.repeat_landscape.tsv"),
+                    # Large files (compressed)
+                    os.path.join(base_path, f"{assembly}.fa.align_with_div.gz"),
+                    # Library outputs (compressed)
+                    os.path.join(base_path, "modeler", f"{assembly}-families.fa.gz"),
+                    os.path.join(base_path, "modeler", f"{assembly}-families.stk"),
+                    os.path.join(base_path, "libraries", f"{assembly}_combined.fa.gz"),
+                    os.path.join(base_path, "libraries", f"{assembly}-rm.fa.gz"),
+                ])
+
+            elif mode == "auto":
+                # Prefer sibling BED next to the assembly; fall back to extracting
+                # softmasked regions from the FASTA.
+                if get_sibling_bed_path(species, assembly) is not None:
+                    expected_files.append(
+                        os.path.join(base_path, f"{assembly}.mask_from_file.bed.gz")
+                    )
+                else:
+                    expected_files.append(
+                        os.path.join(base_path, f"{assembly}.mask_from_ref.bed.gz")
+                    )
+
+            else:
+                # Unknown value (fail loudly rather than silently skipping)
+                raise ValueError(
+                    f"[GABi] Invalid MASKING value: {config.get('MASKING')!r}. "
+                    f"Expected one of: off, on, auto (or their aliases)."
+                )
+
+    return expected_files
+
+# --- Read processing / QC ---
+def get_read_processing_results():
+    """
+    Get all expected read processing outputs (SAMPLE-CENTRIC).
+    Since reads are now processed once per sample (not per assembly),
+    we deduplicate by sample_id.
+    """
+    outs = []
+    seen_samples = set()  # Track (sample_id, read_type) to avoid duplicates
+
+    for sp, asm, sid in all_samples_iter():
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            if not sample_data.get("read_type"):
+                continue
+
+            for rt_key in sample_data["read_type"]:
+                if rt_key in ["None", None]:
+                    continue
+
+                rt_norm = normalize_read_type(rt_key)
+                dedup_key = (sid, rt_norm)
+
+                # Skip if we've already added outputs for this sample/read_type
+                if dedup_key in seen_samples:
+                    continue
+                seen_samples.add(dedup_key)
+
+                # Pre-aligned input: there is no FASTQ to trim, QC or aggregate,
+                # so module B contributes nothing for this sample - including the
+                # per-sample MultiQC report, which would otherwise be requested
+                # with no inputs to summarise.
+                if is_bam_entry(sp, asm, sid, rt_key):
+                    continue
+
+                _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                if not reads:
+                    continue
+
+                # Base path for sample data (sample-centric)
+                base_path = os.path.join(
+                    config["OUT_FOLDER"], "GABi_results", "data", sid, rt_norm
+                )
+
+                for grp in _enumerate_groups(rt_norm, reads):
+                    idx = grp["idx"]
+                    base = grp["base"]
+
+                    if grp["kind"] == "long":
+                        # Raw long reads (symlinked)
+                        outs.append(os.path.join(
+                            base_path, f"Path{idx}_{base}.fq.gz"
+                        ))
+
+                        # NanoPlot for raw reads
+                        outs.append(os.path.join(
+                            base_path, "reports", f"Path{idx}_{base}_nanoplot"
+                        ))
+
+                        # HiFi-specific outputs
+                        if rt_norm == "hifi":
+                            # ULI primer check
+                            outs.append(os.path.join(
+                                base_path, "reports", f"Path{idx}_{base}_uli_mqc.yaml"
+                            ))
+                            # Filtered reads if enabled
+                            if _as_bool(config.get("FILTER_HIFI", False)):
+                                outs.append(os.path.join(
+                                    base_path, "processed", f"Path{idx}_{base}_filtered.fq.gz"
+                                ))
+
+                        # ONT correction if enabled
+                        if rt_norm == "ont" and _as_bool(config.get("CORRECT_ONT", False)):
+                            outs.append(os.path.join(
+                                base_path, "processed", f"Path{idx}_{base}_corrected.fq.gz"
+                            ))
+                            # NanoPlot for corrected reads
+                            outs.append(os.path.join(
+                                base_path, "reports", f"Path{idx}_{base}_corrected_nanoplot"
+                            ))
+
+                    elif grp["kind"] == "pe":
+                        if _as_bool(config.get("TRIM_PE", True)):
+                            # Trimmed PE reads
+                            outs.append(os.path.join(
+                                base_path, "processed", f"Path{idx}_{base}_R1_trimmed.fq.gz"
+                            ))
+                            outs.append(os.path.join(
+                                base_path, "processed", f"Path{idx}_{base}_R2_trimmed.fq.gz"
+                            ))
+                            # Fastp reports
+                            outs.append(os.path.join(
+                                base_path, "reports", f"Path{idx}_{base}_fastp.json"
+                            ))
+                        else:
+                            # Raw PE reads (symlinked)
+                            outs.append(os.path.join(
+                                base_path, f"Path{idx}_{base}_R1.fq.gz"
+                            ))
+                            outs.append(os.path.join(
+                                base_path, f"Path{idx}_{base}_R2.fq.gz"
+                            ))
+
+                # Sample-level MultiQC report (one per sample, at sample level)
+                # Only add once per sample (not per read_type)
+                multiqc_path = os.path.join(
+                    config["OUT_FOLDER"], "GABi_results", "data", sid,
+                    "multiqc_report.html"
+                )
+                if multiqc_path not in outs:
+                    outs.append(multiqc_path)
+
+        except (KeyError, TypeError, AttributeError):
+            pass
+
+    return outs
+
+# --- Mapping & dedup ---
+def get_mapping_results():
+    outs = []
+    seen = set()  # track (species, assembly) for aggregate reports
+
+    for sp, asm, sid in all_samples_iter():
+        # Get sample data ONCE at the beginning
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            if not sample_data.get("read_type"):
+                continue
+
+            # Count valid read types
+            valid_techs = [rt for rt in sample_data["read_type"]
+                          if rt != "None" and rt is not None]
+            tech_count = len(valid_techs)
+
+            bdir = os.path.join(config["OUT_FOLDER"], "GABi_results", sp, asm, "samples", sid, "BAMs")
+
+            # Process each read type
+            for rt_key in valid_techs:
+                rt_norm = normalize_read_type(rt_key)
+                rt, trim, reads = _get_sample_node(sp, asm, sid, rt_key)
+
+                if not rt or not reads:
+                    continue
+
+                # per-group outputs
+                for grp in _enumerate_groups(rt, reads):
+                    idx = grp["idx"]
+                    base = grp["base"]
+                    stem = f"{rt_norm}_Path{idx}{_SEP}{base}"
+
+                    if grp["kind"] == "pe":
+                        if _as_bool(config.get("DEDUP_PE", True)):
+                            outs += [
+                                os.path.join(bdir, f"{stem}.markdup.bam"),
+                                os.path.join(bdir, f"{stem}.markdup.bam.bai"),
+                            ]
+                        else:
+                            outs += [
+                                os.path.join(bdir, f"{stem}.sorted.bam"),
+                                os.path.join(bdir, f"{stem}.sorted.bam.bai"),
+                            ]
+                    else:  # long reads
+                        if _as_bool(config.get("DEDUP_LONG", False)):
+                            outs += [
+                                os.path.join(bdir, f"{stem}.markdup.bam"),
+                                os.path.join(bdir, f"{stem}.markdup.bam.bai"),
+                            ]
+                        else:
+                            outs += [
+                                os.path.join(bdir, f"{stem}.sorted.bam"),
+                                os.path.join(bdir, f"{stem}.sorted.bam.bai"),
+                            ]
+
+                # per sample+readtype merged + QC
+                outs += [
+                    os.path.join(bdir, f"{sid}.{rt_norm}.merged.bam"),
+                    os.path.join(bdir, f"{sid}.{rt_norm}.merged.bam.bai"),
+                    os.path.join(bdir, "qc", f"{sid}.{rt_norm}.flagstat.txt"),
+                    os.path.join(bdir, "qc", f"{sid}.{rt_norm}.idxstats.tsv"),
+                    os.path.join(bdir, "qc", f"{sid}.{rt_norm}.coverage.tsv"),
+                    os.path.join(bdir, "qc", f"{sid}.{rt_norm}.summary.txt"),
+                    os.path.join(bdir, "qc", f"{sid}.{rt_norm}.summary.md"),
+                ]
+
+            # Technology selection: exactly one tech is chosen per sample, and
+            # {sid}.selected.bam symlinks to that tech's BAM. The symlink is what
+            # keeps the DAG static - downstream rules declare one fixed input
+            # path instead of one whose name contains a technology that is not
+            # known until coverage has been measured.
+            # Requested for every sample, single-tech included, so the JSON is
+            # always there for downstream rules to read.
+            outs.append(os.path.join(bdir, "tech_selection.json"))
+            outs.append(os.path.join(bdir, f"{sid}.selected.bam"))
+            outs.append(os.path.join(bdir, f"{sid}.selected.bam.bai"))
+
+            # Sex inference / cross-check: whenever sex contigs are declared for
+            # this assembly, regardless of whether sample_sex_karyo is known.
+            # For unknown samples this drives DV haploid flagging; for declared
+            # samples it's a coverage cross-check (DV still trusts the karyotype)
+            if get_sex_chr(samples_config, sp, asm):  # non-empty asm_sex_chr
+                outs.append(os.path.join(
+                    bdir, "qc", f"{sid}.sex_inference.tsv"
+                ))
+
+            # NOTE: the cross-tech merged BAM ({sid}.merged.bam) used to be
+            # requested here for multi-tech samples. Technologies are no longer
+            # merged - one is selected per sample - so it is not a target any
+            # more. The selected-BAM target is added in the tech-selection phase.
+            #
+            # The removed guard also carried a latent bug worth remembering:
+            # it read `config.get("MERGE_TECH", "auto").lower()`, but YAML parses
+            # an unquoted `off` as the boolean False, so `.lower()` raised
+            # AttributeError, which the handler below swallowed with `continue`.
+            # That skipped the bam_qc.md append, so any assembly whose samples
+            # were ALL multi-tech silently never produced its aggregate BAM QC
+            # report. Config values that can be written as on/off must be
+            # normalised before string methods are used on them.
+
+        except (KeyError, TypeError, AttributeError):
+            continue
+
+        # Add aggregate report once per assembly
+        if (sp, asm) not in seen:
+            seen.add((sp, asm))
+            outs.append(os.path.join(
+                config["OUT_FOLDER"], "GABi_results", sp, asm, "samples", "bam_qc.md"
+            ))
+
+    return outs
+
+# --- Variant calling ---
+def get_variant_calling_results():
+    """Collect variant calling outputs (raw BCF and gVCF)"""
+    outs = []
+    if not _as_bool(config.get("RUN_CALLING", True)):
+        return outs
+
+    for sp, asm, sid in all_samples_iter():
+        # Check if sample has reads
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            has_reads = False
+            for rt_key in sample_data.get("read_type", {}):
+                if rt_key not in ["None", None]:
+                    _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                    if reads:
+                        has_reads = True
+                        break
+            if not has_reads:
+                continue
+        except (KeyError, TypeError, AttributeError):
+            continue
+
+        vcdir = os.path.join(config["OUT_FOLDER"], "GABi_results", sp, asm, "samples", sid, "VCFs")
+
+        # Keep gVCF if configured
+        if _as_bool(config.get("KEEP_gVCF", True)):
+            outs += [
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.g.vcf.gz"),
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.g.vcf.gz.tbi"),
+            ]
+
+    return outs
+
+# --- Variant filtering / tagging ---
+def get_variant_filtering_results():
+    """Collect variant tagging outputs"""
+    outs = []
+    if not _as_bool(config.get("RUN_CALLING", True)):
+        return outs
+
+    RUN_TAGGING = _as_bool(config.get("RUN_TAGGING", True))
+    KEEP_RAW_BCF = _as_bool(config.get("KEEP_RAW_BCF", False))
+
+    for sp, asm, sid in all_samples_iter():
+        # Check if sample has reads
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            has_reads = False
+            for rt_key in sample_data.get("read_type", {}):
+                if rt_key not in ["None", None]:
+                    _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                    if reads:
+                        has_reads = True
+                        break
+            if not has_reads:
+                continue
+        except (KeyError, TypeError, AttributeError):
+            continue
+
+        vcdir = os.path.join(config["OUT_FOLDER"], "GABi_results", sp, asm, "samples", sid, "VCFs")
+
+        if RUN_TAGGING:
+            # Full tagging pipeline: both annotate and filter
+            outs += [
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.tagged.bcf"),
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.tagged.bcf.csi"),
+                os.path.join(vcdir, f"{sid}.tagging_stats.md"),
+            ]
+        else:
+            # No tagging: raw BCF is final
+            outs += [
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.raw.bcf"),
+                os.path.join(vcdir, f"{sid}{_BP_TAG}.raw.bcf.csi"),
+            ]
+
+    return outs
+
+# --- Joint genotyping (GLnexus) ---
+def get_joint_genotyping_results():
+    """Collect joint genotyping outputs (one joint BCF per species/assembly with ≥2 samples)"""
+    outs = []
+    # NOT _as_bool(): it does not recognise 'merge' or 'multi'.
+    if joint_geno_mode() == "off":
+        return outs
+
+    RUN_TAGGING = _as_bool(config.get("RUN_TAGGING", True))
+
+    # Group samples by (species, assembly)
+    asm_sample_count = {}
+    for sp, asm, sid in all_samples_iter():
+        try:
+            sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+            has_reads = False
+            for rt_key in sample_data.get("read_type", {}):
+                if rt_key not in ["None", None]:
+                    _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+                    if reads:
+                        has_reads = True
+                        break
+            if not has_reads:
+                continue
+        except (KeyError, TypeError, AttributeError):
+            continue
+
+        key = (sp, asm)
+        asm_sample_count[key] = asm_sample_count.get(key, 0) + 1
+
+    # Only add joint BCF for assemblies with ≥2 samples
+    for (sp, asm), count in asm_sample_count.items():
+        if count >= 2:
+            jdir = os.path.join(config["OUT_FOLDER"], "GABi_results", sp, asm, "jointVCFs")
+
+            if RUN_TAGGING:
+                outs += [
+                    os.path.join(jdir, f"{asm}.joint.tagged.bcf"),
+                    os.path.join(jdir, f"{asm}.joint.tagged.bcf.csi"),
+                    os.path.join(jdir, f"{asm}.joint.tagging_stats.md"),
+                ]
+                # Indented these inside the 'if' block
+                rdir = os.path.join(config["OUT_FOLDER"], "GABi_results", sp, asm, "relatedness")
+                fdir = os.path.join(config["OUT_FOLDER"], "GABi_results", sp, asm, "finalVCFs")
+                outs += [
+                    os.path.join(rdir, f"{asm}.relatedness_stats.md"),
+                    os.path.join(fdir, f"{asm}.joint.clean.bcf"),
+                    os.path.join(fdir, f"{asm}.joint.clean.bcf.csi"),
+                    os.path.join(fdir, f"{asm}.joint.clean_stats.md"),
+                    os.path.join(fdir, f"{asm}.joint.final.bcf"),
+                    os.path.join(fdir, f"{asm}.joint.final.bcf.csi"),
+                    os.path.join(fdir, f"{asm}.ld_prune_stats.md"),
+                ]
+            else:
+                outs += [
+                    os.path.join(jdir, f"{asm}.joint.bcf"),
+                    os.path.join(jdir, f"{asm}.joint.bcf.csi"),
+                ]
+        else:
+            if IS_MAIN: print(f"[GABi] Skipping joint genotyping for {sp}/{asm} (only {count} sample)")
+    return outs
+
+# # --- ROH analysis ---
+# def get_roh_results():
+#     """Collect Roller_Coaster ROH analysis outputs"""
+#     outs = []
+#     if not _as_bool(config.get("RUN_ROCO", False)):
+#         return outs
+
+#     for sp, asm, sid in all_samples_iter():
+#         # Check if sample has reads
+#         try:
+#             sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+#             has_reads = False
+#             for rt_key in sample_data.get("read_type", {}):
+#                 if rt_key not in ["None", None]:
+#                     _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+#                     if reads:
+#                         has_reads = True
+#                         break
+#             if not has_reads:
+#                 continue
+#         except (KeyError, TypeError, AttributeError):
+#             continue
+
+#         rohdir = os.path.join(config["OUT_FOLDER"], "GABi_results", sp, asm, "samples", sid, "ROH")
+#         outs += [
+#             os.path.join(rohdir, f"{sid}.roh.bed"),
+#             os.path.join(rohdir, f"{sid}.roh.summary"),
+#             os.path.join(rohdir, f"{sid}.chrom_thresholds.tsv"),
+#             os.path.join(rohdir, f"{sid}.windows.tsv.gz"),
+#             os.path.join(rohdir, f"{sid}.genome_stats.txt"),
+#             os.path.join(rohdir, f"{sid}.heterozygosity_plots.pdf"),
+#             os.path.join(rohdir, f"{sid}.froh_proportion.pdf"),
+#             os.path.join(rohdir, f"{sid}.froh_count.pdf"),
+#             os.path.join(rohdir, f"{sid}.froh_length.pdf"),
+#         ]
+
+#     return outs
+
+# # --- PSMC analysis ---
+# def get_psmc_results():
+#     """Collect PSMC outputs"""
+#     outs = []
+#     if not _as_bool(config.get("RUN_PSMC", False)):
+#         return outs
+
+#     for sp, asm, sid in all_samples_iter():
+#         # Check if sample has reads
+#         try:
+#             sample_data = samples_config["sp_name"][sp]["asm_id"][asm]["sample_id"][sid]
+#             has_reads = False
+#             for rt_key in sample_data.get("read_type", {}):
+#                 if rt_key not in ["None", None]:
+#                     _, _, reads = _get_sample_node(sp, asm, sid, rt_key)
+#                     if reads:
+#                         has_reads = True
+#                         break
+#             if not has_reads:
+#                 continue
+#         except (KeyError, TypeError, AttributeError):
+#             continue
+
+#         smcdir = os.path.join(config["OUT_FOLDER"], "GABi_results", sp, asm, "samples", sid, "SMC")
+
+#         # Always include validation status and stats
+#         outs += [
+#             os.path.join(smcdir, f"{sid}.psmcfa.status"),
+#             os.path.join(smcdir, f"{sid}.psmcfa.stats.txt"),
+#         ]
+
+#         # Always include PSMC outputs (even if empty when validation fails)
+#         outs += [
+#             os.path.join(smcdir, f"{sid}.psmc"),
+#             os.path.join(smcdir, f"{sid}.combined.psmc"),
+#             os.path.join(smcdir, f"{sid}.psmc_diagnostics.txt"),
+#         ]
+
+#         # Always include plot script
+#         outs.append(os.path.join(smcdir, f"{sid}.plot_psmc.R"))
+
+#     return outs
+
+
+# -------------------------------------------------------------------------------
+# MAIN OUTPUT FUNCTION
+# -------------------------------------------------------------------------------
+
+def validate_bam_entries():
+    """Check pre-aligned inputs before the DAG is built.
+
+    sample_is_bam_entry() raises when a sample mixes BAM and read input, or
+    declares more than one BAM. Called from here rather than beside
+    validate_sex_config() because it needs _get_sample_node() and
+    all_samples_iter(), both defined further down.
+    """
+    n = 0
+    for sp, asm, sid in all_samples_iter():
+        if sample_is_bam_entry(sp, asm, sid):
+            n += 1
+    if n and IS_MAIN:
+        print(f"[GABi] Pre-aligned input: {n} sample(s) enter from a BAM "
+              f"(trimming and mapping are skipped for them)")
+
+
+def get_all_expected_outputs():
+    validate_bam_entries()
+
+    expected_files = []
+
+    # Assembly stats (gfastats always runs, compleasm respects RUN_COMPL)
+    expected_files.extend(get_asm_stats_results())
+
+    # Conditionally add repeat masking results based on data table
+    expected_files.extend(get_repeat_masking_results())
+
+    # Always add read processing/QC results (based on control panel choices)
+    expected_files.extend(get_read_processing_results())
+
+    # Check if mapping should be run considering data availability
+    mapping_on = _as_bool(config.get("READS_MAPPING", True))
+    if mapping_on:
+        # Add mapping results (mapping + dedup + merge + QC)
+        expected_files.extend(get_mapping_results())
+
+        # Variant calling depends on mapping and control panel choices
+        expected_files.extend(get_variant_calling_results())
+
+        # Tagging depends on variant calling control panel choices
+        expected_files.extend(get_variant_filtering_results())
+
+        # Joint genotyping
+        expected_files.extend(get_joint_genotyping_results())
+
+        # # ROH analysis
+        # expected_files.extend(get_roh_results())
+
+        # # PSMC analysis
+        # expected_files.extend(get_psmc_results())
+    else:
+        if IS_MAIN: print("[GABi] READS_MAPPING is off - pipeline will run assembly stats and read QC only, and masking if enabled.")
+    return expected_files
+
+
+# -------------------------------------------------------------------------------
+# INCLUDE RULE FILES
+# -------------------------------------------------------------------------------
+
+include: "rules/0_download_data.smk"
+include: "rules/A_asm_stats.smk"
+include: "rules/B_trim_reads.smk"
+include: "rules/C_repeat_masking.smk"
+include: "rules/D_map_reads.smk"
+include: "rules/E_variant_call.smk"
+include: "rules/F_filter_variants.smk"
+#include: "rules/G_het_analysis.smk"
+#include: "rules/H_smc_analysis.smk"
+
+
+# -------------------------------------------------------------------------------
+# TARGET RULE
+# -------------------------------------------------------------------------------
+
+rule all:
+    input:
+        get_all_expected_outputs()

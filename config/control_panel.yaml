@@ -1,0 +1,151 @@
+###################################################################################################
+# GABi MAIN SETTINGS                                                                              #
+###################################################################################################
+# Full docs: github.com/diegomics/GABi/wiki/Control_Panel#main-settings
+
+# GABi data table | "google-spreadsheet-link" / "xlsx-path" (or csv/tsv/txt path)
+## Fixed columns (see example). Paths must be on binded partition in the container (see /execution)
+DATA_TABLE: "https://docs.google.com/spreadsheets/d/1WzM6GReGG_2oiKBuVbZZvO1UfZxEpJ3pIFQB3R8AkTY/edit?usp=sharing"
+
+# Output location (a "GABi_results" folder is created here) | "/path"
+## The base of the path must be on binded partition in the container (see GABi/execution configs)
+OUT_FOLDER: "/scratch/ddepanis/Parrots_project"
+
+# Per-job max resources
+myCPU: 24    # max cores per job | 2-24
+myRAM: 512   # max RAM per job, GB | min 4
+myRUN: 240   # max time per job, HOURS
+
+# Temp dir for intermediate files | "default" (OUT_FOLDER/tmp) / "auto" (local SSD) / "/path"
+TEMP_DIR: auto
+
+# Fast temp for I/O-heavy steps | "default" (OUT_FOLDER/tmp) / "/dev/shm" or RAM-mount path
+## This is CRITICAL for Repeat Masking!
+FAST_TEMP_DIR: "/dev/shm"
+
+
+###################################################################################################
+# OPTIONAL SETTINGS                                                                               #
+###################################################################################################
+
+# Quick reference QC  -----------------------------------------------------------------------------
+# Full docs: github.com/diegomics/GABi/wiki/Control_Panel#reference-qc
+
+# Gene completeness analysis (off = gfastats classic metrics only) | "on" / "off" (default)
+RUN_COMPL: off
+
+# BUSCO lineage | auto (may fail) / <name> e.g. eukaryota, primates, insecta, fungi
+LINEAGE: eukaryota
+
+
+# Masking  ----------------------------------------------------------------------------------------
+# Full docs: github.com/diegomics/GABi/wiki/Control_Panel#masking
+
+# Reference assembly masking | "auto" (BED from softmask) / "on" (RepeatModeler+Masker) / "off"
+MASKING: auto
+
+
+# Reads -------------------------------------------------------------------------------------------
+# Full docs: github.com/diegomics/GABi/wiki/Control_Panel#reads-data
+
+# Trim short paired-end reads (Illumina/10x) | "on" (default) / "off"
+TRIM_PE: on
+
+# Filter adapter-containing HiFi reads | "on" (default) / "off"
+FILTER_HIFI: on
+
+
+# Mapping -----------------------------------------------------------------------------------------
+# Full docs: github.com/diegomics/GABi/wiki/Control_Panel#mapping
+
+# Map reads (off = assembly stats + reads QC only) | "on" / "off"
+READS_MAPPING: on
+
+# Deduplicate reads | "on" (default) / "off"
+DEDUP_PE: on
+DEDUP_LONG: on
+
+# Downsample mapped reads to a target per-sample coverage | integer e.g. "30". "0" = off (default)
+#DOWN_X: 0   # TODO
+
+# Tech selection thresholds, for samples with more than one technology
+## If any technology reaches GOOD_TECH_COV, DATA_PRIORITY decides. If none, highest coverage wins.
+GOOD_TECH_COV: 15     # >= this -> "good enough"
+MIN_TECH_COV: 6       # absolute min coverage for a tech to be usable at all
+
+
+# Calling -----------------------------------------------------------------------------------------
+# Full docs: github.com/diegomics/GABi/wiki/Control_Panel#calling
+
+# Run variant caller | "on" / "off"
+RUN_CALLING: off
+
+# Caller tool | "deep" (DeepVariant) / "bcft" (BCFtools) / "gatk" (HaplotypeCaller)
+## Recommended: deep > bcft > gatk. Pick bcft if DeepVariant strains your disk I/O.
+##  gatk only for illumina/10x (hifi works but is discouraged)
+CALLER: deep
+
+# VCF resolution | "block" (gVCF, faster) / "basepair" (per-site, much larger files)
+RESOLUTION: block
+
+# PairHMM AVX (GATK only!) | "auto" (AVX for short reads. Default) / "on" (force) / "off"
+USE_AVX: auto
+
+# Tech priority for calling when >1 type/sample | e.g. hifi>illumina>ont
+## Used to break ties between technologies that reach GOOD_TECH_COV (see above).
+DATA_PRIORITY: hifi>illumina>ont
+
+# Keep gVCF files | "on" / "off"
+KEEP_gVCF: on
+
+# Joint genotyping if >=2 samples of same assembly (will keep gVCF anyway)
+## "off" / "merge" (combines per sample gVCF. Cohort may mix seq-techs. Uses GLnexus for deep/gatk,
+## `bcftools merge` for bcft) / "multi" (Only for bcft & if all samples use same seq-tech. Calls
+## the whole cohort from bam via `bcftools mpileup -b | call -mv`)
+JOINT_GENO: off
+
+
+# Variants QC & tagging ---------------------------------------------------------------------------
+# Full docs: github.com/diegomics/GABi/wiki/Control_Panel#tagging
+
+# Add INFO (TYPE, MASKED) and FILTER (LOW_DP, LOW_GQ...) tags | "on" / "off"
+RUN_TAGGING: off
+
+# Tag thresholds below: [shared] both | [gatk] GATK only | [deep] DeepVariant only
+
+MIN_DEPTH: 8       # [shared] min depth | int / auto (floor(WMD/3))
+MAX_DEPTH: auto    # [shared] max depth | int / auto (ceil(3*WMD))
+MIN_GQ: 10         # [shared] min genotype quality (also LOW_RGQ on hom-ref)
+MIN_MQ: 40         # [gatk]   min site mapping quality (INFO/MQ)
+MIN_QUAL: 1        # [deep]   min site QUAL (-> LOW_QUAL)
+
+# Allele balance, biallelic diploid | [shared] (GATK from AD, DV from VAF)
+AB_HET_MIN: 0.25       # het alt-fraction >= this
+AB_HET_MAX: 0.75       # het alt-fraction <= this
+AB_HOM_REF_MAX: 0.10   # hom-ref alt-leakage <= this
+
+# Min contig length for downstream analysis, bp | integer
+TINY_CONTIG_BP: 1000000
+
+# Keep raw untagged BCF | "on" / "off"  (off saves space. Turn on for custom filtering later)
+KEEP_RAW_BCF: on
+
+# Joint genotyping tags
+# Only if JOINT_GENO: on AND RUN_TAGGING: on. Site-level only (handle per-sample QC downstream)
+MIN_AQ: 10           # [joint] min allele quality (INFO/AQ from GLnexus)
+MIN_JOINT_QUAL: 1    # [joint] min site QUAL
+MAX_MISSING: 0.5     # [joint] max fraction of ./. samples (-> LOW_CALL_RATE)
+MIN_AC: auto         # [joint] min allele count | int / auto (max(1, ceil(AN*MIN_AC_FRAC)))
+MIN_AC_FRAC: 0.01    # fraction used when MIN_AC: auto
+KEEP_RAW_JOINT: on   # keep raw untagged joint BCF | on/off
+
+# Relatedness & LD pruning tags
+# Only if JOINT_GENO: on AND RUN_TAGGING: on.
+KING_CUTOFF: 0.0884        # KING-robust kinship to flag as related | default excludes 2nd-degree+
+KING_MAF: 0.05             # MAF cutoff before LD pruning
+KING_LD_MIN_SAMPLES: 50    # min cohort for LD pruning (below: F03 skips LD, F05 skips annotation)
+
+# plink2 --indep-pairwise | window (SNPs) / step (SNPs) / r2
+KING_LD_WINDOW: 50
+KING_LD_STEP: 5
+KING_LD_R2: 0.2

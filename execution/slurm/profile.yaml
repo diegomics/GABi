@@ -1,0 +1,77 @@
+# -----------------------------------------------------------------------------
+# Executor & Concurrency
+# -----------------------------------------------------------------------------
+executor: slurm
+
+# Max number of jobs Snakemake will submit to the queue at once.
+# Keep this reasonable (e.g., 100) to avoid annoying the cluster admins.
+jobs: 100
+
+# Rate limits to prevent DDoS-ing the Slurm controller
+max-jobs-per-second: 1
+max-status-checks-per-second: 0.01
+
+# -----------------------------------------------------------------------------
+# Global Resource Limits
+# -----------------------------------------------------------------------------
+# Max ENA/URL downloads running at once, across every submitted job. Each
+# download rule consumes one. The whole cluster usually shares one
+# institutional address range, so ENA sees a single very busy client.
+resources:
+  downloads: 4
+
+# -----------------------------------------------------------------------------
+# Error Handling & Latency
+# -----------------------------------------------------------------------------
+# How many times to restart a job if it fails (0 = fail immediately)
+restart-times: 0
+
+# Wait time for the filesystem to catch up after a job finishes (crucial on networked FS)
+latency-wait: 90
+seconds-between-status-checks: 60
+
+keep-going: true
+printshellcmds: false
+rerun-triggers: [mtime] # comment this line to track ALL changes (code, params, input)
+
+# -----------------------------------------------------------------------------
+# Default Job Resources (Slurm Specifics)
+# -----------------------------------------------------------------------------
+default-resources:
+  slurm_account: "agmazzoni"
+  slurm_partition: "begendiv,main,scavenger"
+  constraint: "no_gpu"
+  qos: "standard"
+  mem_mb: 2000
+  runtime: 60
+#  slurm_extra: "'--mail-type=FAIL --mail-user=user@domain.de'"
+
+# -----------------------------------------------------------------------------
+# Slurm Plugin Settings
+# -----------------------------------------------------------------------------
+# Where Snakemake writes the Slurm log of each job (default: .snakemake/slurm_logs/)
+#slurm-logdir: "logs/slurm"
+
+# Keep Slurm logs of successful jobs too (default: deleted on success)
+#slurm-keep-successful-logs: true
+
+# Prefix for Slurm job names (the rule name is shown in the job comment: squeue -o "%.10i %.40k")
+slurm-jobname-prefix: "GABi"
+
+# Retries per job-status check when the Slurm query fails (e.g. accounting DB hiccup).
+# If all fail, Snakemake loses track of the running jobs and the run hangs.
+# Spaced by max-status-checks-per-second (0.01 -> 100 s): 70 ≈ 2 h (default 5 ≈ 7 min).
+slurm-status-attempts: 70
+
+# Where job status comes from: "sacct" (default, accounting DB) or "squeue" (controller).
+# squeue avoids DB errors but can miss jobs finished more than MinJobAge ago; comment this line to keep sacct.
+#slurm-status-command: "squeue"
+
+# -----------------------------------------------------------------------------
+# Software Stack (Apptainer/Singularity)
+# -----------------------------------------------------------------------------
+software-deployment-method: [apptainer]
+
+# IMPORTANT!!! bind here all the folders you use, like "--bind /my/storage:/my/storage --bind /my/folder:/my/folder"
+# In the case you are using local or need no binds, leave this line commented out
+#apptainer-args: "--bind /my/storage:/my/storage"

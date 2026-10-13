@@ -1,0 +1,8 @@
+# Container definitions for the GABi pipeline
+containers:
+  gabi_base: "docker://diegomics/gabi_base:0.1.0"
+  compleasm: "docker://huangnengcsu/compleasm:v0.2.9"
+  tetools: "docker://dfam/tetools:2.00"
+  gatk: "docker://broadinstitute/gatk:4.7.0.0"
+  deepvariant: "docker://google/deepvariant:1.10.0"
+  glnexus: "docker://ghcr.io/dnanexus-rnd/glnexus:v1.4.1"

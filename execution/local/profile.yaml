@@ -1,0 +1,46 @@
+# -----------------------------------------------------------------------------
+# Global Concurrency Limits
+# -----------------------------------------------------------------------------
+# Maximum number of CPU cores Snakemake can use AT ONCE across ALL jobs.
+cores: 96
+
+# -----------------------------------------------------------------------------
+# Machine Protection (Global Resource Limits)
+# -----------------------------------------------------------------------------
+# These limits prevent Snakemake from spawning too many large-memory jobs
+# that would crash your workstation, even if you have enough free CPU cores.
+resources:
+  mem_mb: 500000
+  # Max ENA/URL downloads running at once, across the whole workflow. Each
+  # download rule consumes one. Keep modest since EBI refuses connections from
+  # an address that opens too many at once.
+  downloads: 4
+
+# -----------------------------------------------------------------------------
+# Default Job Resources
+# -----------------------------------------------------------------------------
+default-resources:
+  mem_mb: 2000
+  threads: 1
+
+# -----------------------------------------------------------------------------
+# Execution Behavior & Latency
+# -----------------------------------------------------------------------------
+keep-going: true
+printshellcmds: false
+
+# Wait time (seconds) for filesystem operations.
+latency-wait: 60
+
+# Determines what triggers a job rerun. [mtime] checks file modification dates.
+rerun-triggers: [mtime]
+
+# -----------------------------------------------------------------------------
+# Software Stack (Apptainer/Singularity)
+# -----------------------------------------------------------------------------
+software-deployment-method: [apptainer]
+
+# Bind paths for local execution.
+# IMPORTANT!!! bind here all the folders you use, like "--bind /my/storage:/my/storage --bind /my/folder:/my/folder"
+# In the case you are using slurm or need no binds, leave this line commented out
+#apptainer-args: "--bind /my/storage:/my/storage"
