@@ -225,8 +225,7 @@ repData <- repData[!repData$Category %in% excludeCategories, ]
 presentCategories <- intersect(rev(landscapeOrder), unique(repData$Category))
 
 # A class RepeatMasker reports but landscapeOrder has never heard of used to
-# become factor NA here and was then deleted by complete.cases() below - gone
-# from the plot, with nothing said. Keep it instead, painted grey, and say so.
+# become factor NA here... Keep it, painted grey, and say so.
 unlistedCategories <- setdiff(unique(repData$Category), presentCategories)
 if (length(unlistedCategories) > 0) {
   cat(sprintf("WARNING: %d repeat class(es) absent from landscapeOrder, drawn in grey: %s\n",
@@ -253,13 +252,26 @@ cat(sprintf("Found %d categories across %d samples\n",
             length(unique(repData$Category)),
             length(unique(repData$Sample))))
 
+# X axis breaks every 5, across whatever divergence range this divsum actually
+# covers, so a landscape that stops at 25 - or one that runs past 50 - is still
+# labelled. Derived from the data rather than hardcoded
+xmax <- suppressWarnings(max(repData$Kimura, na.rm=TRUE))
+if (!is.finite(xmax)) {
+  stop("Error: no usable divergence values in the input TSV(s)", call.=FALSE)
+}
+xbreaks <- seq(0, max(5, ceiling(xmax / 5) * 5), by=5)
+
 # Create plot
 cat("Creating SVG plot...\n")
 svg(args[2], height=10, width=12)
 
 p <- ggplot(repData, aes(x=Kimura, y=Per, fill=Category)) +
   geom_col(position="stack", width=1) +
-  scale_x_continuous(breaks=seq(0, 50, by=5), limits=c(0, 50)) +
+  # No limits= here, deliberately. geom_col(width=1) makes every bar span
+  # x +/- 0.5, so limits=c(0, 50) put the bars at divergence 0 and 50 partly
+  # use coord_cartesian() if a view window is ever wanted, as that clips the view
+  # without discarding data.
+  scale_x_continuous(breaks=xbreaks) +
   scale_y_continuous(expand=c(0, 0)) +
   scale_fill_manual(values=customCols, na.value="#CCCCCC", drop=TRUE) +
   labs(
