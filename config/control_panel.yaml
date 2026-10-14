@@ -106,20 +106,21 @@ JOINT_GENO: off
 
 
 # Variants QC & tagging ---------------------------------------------------------------------------
-# Full docs: github.com/diegomics/GABi/wiki/Control_Panel#tagging
+# Full docs: github.com/diegomics/GAME/wiki/Control_Panel#tagging
 
 # Add INFO (TYPE, MASKED) and FILTER (LOW_DP, LOW_GQ...) tags | "on" / "off"
 RUN_TAGGING: off
 
-# Tag thresholds below: [shared] both | [gatk] GATK only | [deep] DeepVariant only
+# Tag thresholds below. The marker shows which callers each one affects:
+# [all] every caller | [gatk,bcft] | [deep,bcft]
 
-MIN_DEPTH: 8       # [shared] min depth | int / auto (floor(WMD/3))
-MAX_DEPTH: auto    # [shared] max depth | int / auto (ceil(3*WMD))
-MIN_GQ: 10         # [shared] min genotype quality (also LOW_RGQ on hom-ref)
-MIN_MQ: 40         # [gatk]   min site mapping quality (INFO/MQ)
-MIN_QUAL: 1        # [deep]   min site QUAL (-> LOW_QUAL)
+MIN_DEPTH: 8       # [all]        min depth | int / auto (floor(WMD/3))
+MAX_DEPTH: auto    # [all]        max depth | int / auto (ceil(3*WMD))
+MIN_GQ: 10         # [all]        min genotype quality (also LOW_RGQ on hom-ref)
+MIN_MQ: 40         # [gatk,bcft]  min site mapping quality (INFO/MQ)
+MIN_QUAL: 1        # [deep,bcft]  min site QUAL (-> LOW_QUAL)
 
-# Allele balance, biallelic diploid | [shared] (GATK from AD, DV from VAF)
+# Allele balance, biallelic diploid | [all] (AD ratio for GATK/bcftools, VAF for DeepVariant)
 AB_HET_MIN: 0.25       # het alt-fraction >= this
 AB_HET_MAX: 0.75       # het alt-fraction <= this
 AB_HOM_REF_MAX: 0.10   # hom-ref alt-leakage <= this
