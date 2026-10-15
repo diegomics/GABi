@@ -92,8 +92,8 @@ resources:
     max_cpu: 16
     mem_gb_per_uncompressed_gb: 64.0
     base_mem_gb: 64
-    runtime_min_per_uncompressed_gb: 2880   # 48 h/GB
-    base_runtime_min: 1440                  # 24 h
+    runtime_min_per_uncompressed_gb: 2880   # 48 h
+    base_runtime_min: 1800                  # 30 h
 
   masking_post:
     max_cpu: 4
