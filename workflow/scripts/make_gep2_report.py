@@ -7,12 +7,14 @@
 
 # Generates a markdown report aggregating results from:
 # - gfastats (assembly metrics)
-# - compleasm (gene completeness)
-# - Merqury (k-mer QV and completeness)
+# - compleasm/busco (gene completeness)
+# - busco (gene completeness)
+# - Merqury/MerquryFK (k-mer QV and completeness)
 # - GenomeScope2 (genome profiling)
 # - Inspector (structural errors)
 # - Blobtools (contamination screening)
 # - FCS-GX (contamination screening)
+# - and more!
 
 import argparse
 import re
@@ -25,7 +27,56 @@ import requests
 from urllib.parse import quote
 from pathlib import Path
 
-__version__ = '0.1.6'
+__version__ = '0.4'
+
+# ---- Star-rating calibration -------------------------------------------------
+# Adapts EBP's N50 targets to species with small chromosomes...
+# The idea here is to cap absolute tiers at what chromosome can physically hold.
+# expected_chr_size (E) = genome_size / haploid_number (mean chromosome).
+# CHR_SCALE_FRAC (0.90) estimates chromosome N50 from the mean and keeps
+# karyotype variance in the assembly's favor.
+
+CHR_SCALE_FRAC = 0.90   # '****' bar: Chromosome-scale (EBP "C")
+CHR_HALF_FRAC  = 0.50   # '***-' bar when the absolute tier is out of reach
+CHR_TENTH_FRAC = 0.10   # '**--' bar likewise
+
+# Absolute (uncapped) tiers, as (****, ***-, **--) in bp.
+N50_BASE_TIERS = {
+    'scaffold_n50': (100_000_000, 10_000_000, 100_000),
+    'contig_n50':   ( 10_000_000,  1_000_000, 100_000),
+}
+
+
+def n50_tiers(metric_type, expected_chr_size=None):
+    """Return (****, ***-, **--) bp thresholds for N50 metric.
+    
+    A scaffold cannot exceed a chromosome and a contig cannot exceed a scaffold,
+    so any tier above chromosome scale is unreachable by construction and is
+    pulled down to it...
+
+    If `expected_chr_size` is None or large enough, returns the  default
+    absolute tiers untouched.
+    """
+    t4, t3, t2 = N50_BASE_TIERS[metric_type]
+    if not expected_chr_size:
+        return t4, t3, t2
+    return (min(t4, CHR_SCALE_FRAC * expected_chr_size),
+            min(t3, CHR_HALF_FRAC  * expected_chr_size),
+            min(t2, CHR_TENTH_FRAC * expected_chr_size))
+
+
+def l90_tiers(haploid_number):
+    """Return (****, ***-, **--) L90 thresholds for a haploid number.
+
+    Sets 4-star target at n scaffolds, scaling up for lower tiers. Enforces a 
+    minimum offset at n=1 so 3-star targets remain distinct from 4-star.
+    """
+    if not haploid_number:
+        return None
+    return (haploid_number,
+            max(haploid_number + 1, (haploid_number * 3) // 2),
+            haploid_number * 5)
+
 
 # This is a crap and isn't working yet, will work on it soon...
 def convert_md_to_pdf(md_file, pdf_file=None):
@@ -123,31 +174,47 @@ def convert_md_to_pdf(md_file, pdf_file=None):
 def get_species_genomic_data_from_goat(species):
     """Get taxon ID, family/order lineage, haploid number and source from GoaT API based on species name.
 
-    Returns a dict with keys: taxon_id, family, haploid_number, haploid_source, error.
+    Looks up the species name on GoaT. If the species is not present, falls back to the genus.
+
+    Returns a dict with keys: taxon_id, family, haploid_number, haploid_source, resolution_level, error.
     'family' holds the family-rank name when available, otherwise the order-rank name
     (or None if neither is present).
+    'resolution_level' is 'species' or 'genus', indicating which name matched.
     """
     result = {
         'taxon_id': None,
         'family': None,
         'haploid_number': None,
         'haploid_source': None,
+        'genome_size': None,
+        'genome_size_source': None,
+        'resolution_level': None,
         'error': None
     }
 
     try:
-        species_encoded = quote(species)
-        search_url = f'https://goat.genomehubs.org/api/v2/search?query=tax_name%28{species_encoded}%29&result=taxon'
-        response = requests.get(search_url, timeout=30)
-        response.raise_for_status()
+        # Try the species name; if GoaT has no match, fall back to the genus.
+        parts = species.split()
+        candidates = [(species, 'species')]
+        if len(parts) >= 2:
+            candidates.append((parts[0], 'genus'))
 
-        search_data = response.json()
+        first_result = None
+        for name, level in candidates:
+            name_encoded = quote(name)
+            search_url = f'https://goat.genomehubs.org/api/v2/search?query=tax_name%28{name_encoded}%29&result=taxon'
+            response = requests.get(search_url, timeout=30)
+            response.raise_for_status()
+            search_data = response.json()
+            if search_data.get('results'):
+                first_result = search_data['results'][0]['result']
+                result['resolution_level'] = level
+                break
 
-        if not search_data.get('results'):
+        if first_result is None:
             result['error'] = "Species not found"
             return result
 
-        first_result = search_data['results'][0]['result']
         taxon_id = first_result['taxon_id']
         result['taxon_id'] = taxon_id
 
@@ -166,7 +233,6 @@ def get_species_genomic_data_from_goat(species):
         record_url = f'https://goat.genomehubs.org/api/v2/record?recordId={taxon_id}&result=taxon&taxonomy=ncbi'
         record_response = requests.get(record_url, timeout=30)
         record_response.raise_for_status()
-
         record_data = record_response.json()
 
         if not record_data.get('records'):
@@ -183,6 +249,14 @@ def get_species_genomic_data_from_goat(species):
             result['haploid_source'] = haploid_source
         else:
             result['error'] = "Haploid number not available"
+
+        # Genome size, used only to estimate mean chromosome size (genome_size /
+        # haploid_number) for the small-genome star-rating carve-out. Optional:
+        # if absent, the carve-out simply never fires and scoring is unchanged.
+        size_info = attributes.get('genome_size', {})
+        if size_info.get('value') is not None:
+            result['genome_size'] = size_info['value']
+            result['genome_size_source'] = size_info.get('aggregation_source')
 
         return result
 
@@ -218,11 +292,19 @@ def parse_gfastats(filepath):
         'gaps': r'# gaps in scaffolds:\s*(\d+)',
         'total_gap_bp': r'Total gap length in scaffolds:\s*(\d+)'
     }
-    
+
+    # Track fields whose regex found nothing: they silently become "N/A" with a
+    # '····' rating in the report, so a gfastats wording change would otherwise
+    # drop metrics without anyone noticing. Reported in the run log instead.
+    missing = []
     for key, pattern in patterns.items():
         match = re.search(pattern, content)
         if match:
             metrics[key] = match.group(1)
+        else:
+            missing.append(key)
+    metrics['_missing'] = missing
+    metrics['_source'] = filepath
     
     # Calculate gaps per Gbp
     if 'total_bp' in metrics and 'gaps' in metrics:
@@ -239,6 +321,7 @@ def parse_compleasm(filepath):
     metrics = {
         'eukaryota_single': None,
         'eukaryota_dupl': None,
+        'eukaryota_lineage': None,
         'other_lineage': None,
         'other_single': None,
         'other_dupl': None
@@ -263,8 +346,13 @@ def parse_compleasm(filepath):
             if 'eukaryota' in lineage_name.lower():
                 metrics['eukaryota_single'] = s_percent
                 metrics['eukaryota_dupl'] = d_percent
+                # Format nicely by targeting the _odb tag only (see parse_busco_summary),
+                # so multi-underscore names like stramenopiles_alveolata_odb10 stay intact.
+                metrics['eukaryota_lineage'] = lineage_name.replace('_odb', ' (odb') + ')' if '_odb' in lineage_name else lineage_name
             else:
-                other_name = lineage_name.replace('_', ' (') + ')'
+                # Target the _odb tag only, matching parse_busco_summary. The previous
+                # replace('_', ' (') broke multi-underscore lineages (double parens).
+                other_name = lineage_name.replace('_odb', ' (odb') + ')' if '_odb' in lineage_name else lineage_name
                 metrics['other_lineage'] = other_name
                 metrics['other_single'] = s_percent
                 metrics['other_dupl'] = d_percent
@@ -281,6 +369,7 @@ def parse_compleasm_full(filepath):
     metrics = {
         'eukaryota_single': None,
         'eukaryota_dupl': None,
+        'eukaryota_lineage': None,
         'other_lineage': None,
         'other_single': None,
         'other_dupl': None,
@@ -293,7 +382,7 @@ def parse_compleasm_full(filepath):
     
     seen = {}
     counts = {'Single': 0, 'Duplicated': 0, 'Retrocopy': 0,
-              'Fragmented': 0, 'Interspersed': 0, 'Missing': 0}
+              'Fragmented': 0, 'Interspaced': 0, 'Missing': 0}
     total_complete_copies = 0  # All Single/Duplicated rows (all physical copies)
     frameshifted_copies = 0    # Single/Duplicated rows with column 11 > 0
     
@@ -342,6 +431,7 @@ def parse_compleasm_full(filepath):
     if is_eukaryota:
         metrics['eukaryota_single'] = s_percent
         metrics['eukaryota_dupl'] = d_percent
+        metrics['eukaryota_lineage'] = lineage.replace('_odb', ' (odb') + ')' if '_odb' in lineage else lineage
     else:
         lineage_name = lineage.replace('_odb', ' (odb') + ')'
         metrics['other_lineage'] = lineage_name
@@ -351,220 +441,396 @@ def parse_compleasm_full(filepath):
     metrics['frameshift_rate'] = frameshift_rate
     metrics['frameshift_is_eukaryota'] = is_eukaryota
     
+    # The report only ever shows the %, these are the numbers are for sanity-check
+    metrics['_lineage_dir'] = lineage
+    metrics['_counts'] = dict(counts)
+    metrics['_n_markers'] = total
+    metrics['_complete_copies'] = total_complete_copies
+    metrics['_frameshifted_copies'] = frameshifted_copies
+
     return metrics
 
 
-def parse_merqury_qv(filepath, num_assemblies):
+def parse_busco_summary(filepath):
     """
-    Parse Merqury QV file.
-    Format: name\tErrors\tBases\tQV\tErrorRate
-    Returns list of QV values for each assembly.
+    Parse BUSCO short_summary.txt file.
+    BUSCO only outputs one lineage per file, and we omit frameshift rates.
+    """
+    
+    # Initialize dictionary exactly like parse_compleasm (no frameshift keys)
+    metrics = {
+        'eukaryota_single': None, 
+        'eukaryota_dupl': None,
+        'eukaryota_lineage': None,
+        'other_lineage': None, 
+        'other_single': None, 
+        'other_dupl': None
+    }
+    
+    with open(filepath, 'r') as f:
+        content = f.read()
+    
+    # Extract the single lineage name
+    lineage_match = re.search(r'# The lineage dataset is:\s*([^\s(]+)', content)
+    if not lineage_match:
+        return metrics # Return empty metrics if file is malformed
+        
+    lineage_name = lineage_match.group(1)
+    
+    # Extract Single and Duplicated percentages
+    s_match = re.search(r'S:([\d.]+)%', content)
+    d_match = re.search(r'D:([\d.]+)%', content)
+    
+    if s_match and d_match:
+        s_percent = float(s_match.group(1))
+        d_percent = float(d_match.group(1))
+        
+        # Assign to eukaryota or 'other' based on the single lineage
+        if 'eukaryota' in lineage_name.lower():
+            metrics['eukaryota_single'] = s_percent
+            metrics['eukaryota_dupl'] = d_percent
+            metrics['eukaryota_lineage'] = lineage_name.replace('_odb', ' (odb') + ')' if '_odb' in lineage_name else lineage_name
+        else:
+            # Format nicely: e.g., "purpureocillium_takamizusanense (odb12)"
+            other_name = lineage_name.replace('_odb', ' (odb') + ')' if '_odb' in lineage_name else lineage_name
+            metrics['other_lineage'] = other_name
+            metrics['other_single'] = s_percent
+            metrics['other_dupl'] = d_percent
+            
+    return metrics
+
+
+def detect_kmer_tool(qv_file, completeness_file):
+    """Return the QV/completeness table label by peeking at the file header.
+    MerquryFK writes a header row starting with 'Assembly'; Merqury has none.
+    Defaults to 'MERQ' (Merqury) when neither file is readable."""
+    for path in (qv_file, completeness_file):
+        if not path:
+            continue
+        try:
+            with open(path) as f:
+                for line in f:
+                    if line.strip():
+                        first = line.split("\t", 1)[0].strip().lower()
+                        return "MERQ.FK" if first == "assembly" else "MERQ"
+        except OSError:
+            continue
+    return "MERQ"
+
+
+def parse_merqury_qv(filepath, num_assemblies):
+    """Parse a Merqury or MerquryFK .qv summary file.
+
+    Merqury (no header):   <asm>  <asm-only>  <total>  <QV>  <error rate>   -> QV at col 3
+    MerquryFK (header):    Assembly  No Support  Total  Error %  QV         -> QV by name
+    Returns QV per assembly, in order; ignores the trailing 'both' row.
     """
     qv_values = []
-    
+
     try:
-        with open(filepath, 'r') as f:
-            lines = f.readlines()
-        
-        for i in range(min(num_assemblies, len(lines))):
-            parts = lines[i].strip().split('\t')
-            if len(parts) >= 4:
-                qv_values.append(float(parts[3]))
-            else:
-                qv_values.append(None)
-        
+        with open(filepath) as f:
+            rows = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+        if not rows:
+            return [None] * num_assemblies
+
+        qv_idx, start = 3, 0
+        if rows[0] and rows[0][0].strip().lower() == "assembly":   # MerquryFK header
+            start = 1
+            qv_idx = next((i for i, c in enumerate(rows[0])
+                           if c.strip().upper() == "QV"), len(rows[0]) - 1)
+
+        for parts in rows[start:]:
+            if len(qv_values) >= num_assemblies:
+                break
+            label = parts[0].strip().lower() if parts else ""
+            if label == "both" or "+" in label:      # skip combined row
+                continue
+
+            if len(parts) > qv_idx:
+                try:
+                    qv_values.append(float(parts[qv_idx]))
+                    continue
+
+                except ValueError:
+                    pass
+
         # Pad with None if fewer lines than expected
         while len(qv_values) < num_assemblies:
             qv_values.append(None)
-            
+
     except Exception as e:
-        print(f"Warning: Could not parse Merqury QV file: {e}")
+        print(f"Warning: Could not parse QV file: {e}")
         qv_values = [None] * num_assemblies
-    
+
     return qv_values
 
 
 def parse_merqury_completeness(filepath, num_assemblies):
-    """
-    Parse Merqury completeness file.
-    Format: name\tall\tFound\tTotal\tCompleteness
-    Returns list of completeness values for each assembly.
+    """Parse a Merqury or MerquryFK completeness file.
+
+    Merqury (no header):   <asm>  all  <found>  <total>  <completeness %>   -> last col
+    MerquryFK (header):    Assembly  Region  Found  Total  % Covered        -> by name
+    Both put the percentage last; ignores the trailing combined row.
     """
     completeness_values = []
-    
+
     try:
-        with open(filepath, 'r') as f:
-            lines = f.readlines()
-        
-        for i in range(min(num_assemblies, len(lines))):
-            parts = lines[i].strip().split('\t')
-            if len(parts) >= 5:
-                completeness_values.append(float(parts[4]))
-            else:
-                completeness_values.append(None)
-        
+        with open(filepath) as f:
+            rows = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+        if not rows:
+            return [None] * num_assemblies
+
+        pct_idx, start = 4, 0
+        if rows[0] and rows[0][0].strip().lower() == "assembly":   # MerquryFK header
+            start = 1
+            pct_idx = next((i for i, c in enumerate(rows[0])
+                            if c.strip().lower() in ("% covered", "completeness")),
+                           len(rows[0]) - 1)
+
+        for parts in rows[start:]:
+            if len(completeness_values) >= num_assemblies:
+                break
+            label = parts[0].strip().lower() if parts else ""
+            if label == "both" or "+" in label:      # skip asm1+asm2 row
+                continue
+            if len(parts) > pct_idx:
+                try:
+                    completeness_values.append(float(parts[pct_idx]))
+                    continue
+                except ValueError:
+                    pass
+
         while len(completeness_values) < num_assemblies:
             completeness_values.append(None)
-            
+
     except Exception as e:
-        print(f"Warning: Could not parse Merqury completeness file: {e}")
+        print(f"Warning: Could not parse completeness file: {e}")
         completeness_values = [None] * num_assemblies
-    
+
     return completeness_values
 
 
+def parse_merqury_both(filepath, column):
+    """Return the combined asm1+asm2 value from a Merqury/MerquryFK .qv
+    (column="qv") or .completeness.stats (column="completeness") file.
+    The combined row is labelled 'both'/'Both' (or 'asm1+asm2' in MerquryFK
+    completeness); returns None if the file has no such row."""
+    try:
+        with open(filepath) as f:
+            rows = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+        idx = 3 if column == "qv" else 4                   # Merqury (no header)
+        if rows and rows[0][0].strip().lower() == "assembly":   # MerquryFK header
+            names = ("qv",) if column == "qv" else ("% covered", "completeness")
+            idx = next((i for i, c in enumerate(rows[0])
+                        if c.strip().lower() in names), len(rows[0]) - 1)
+        for parts in rows:
+            label = parts[0].strip().lower()
+            if (label == "both" or "+" in label) and len(parts) > idx:
+                return float(parts[idx])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def find_merqury_plots(merqury_dir, asm_id):
-    """
-    Find Merqury plot files in the output directory.
-    
-    Haploid (1 asm) produces:
-      - {prefix}.spectra-cn.fl.png
-      - {prefix}.spectra-asm.fl.png
-    
-    Diploid (2 asm) produces:
-      - {prefix}.{asm1_name}.spectra-cn.fl.png
-      - {prefix}.{asm2_name}.spectra-cn.fl.png
-      - {prefix}.spectra-asm.fl.png
-      - {prefix}.spectra-cn.fl.png (combined)
-    """
+    """Find Merqury/MerquryFK spectra plots. Both use spectra-cn/spectra-asm with
+    .fl/.ln/.st suffixes; prefer filled (.fl), fall back to line/stack."""
     plots = {
         'spectra_cn': [],
         'spectra_asm': None,
         'spectra_cn_combined': None
     }
-    
+
     if not merqury_dir or not os.path.isdir(merqury_dir):
         return plots
+
+    def _first_glob(*patterns):
+        for pat in patterns:
+            hits = sorted(glob.glob(os.path.join(merqury_dir, pat)))
+            if hits:
+                return hits
+        return []
     
     # Find ALL spectra-cn plots
-    cn_pattern = os.path.join(merqury_dir, "*.spectra-cn.fl.png")
-    cn_files = sorted(glob.glob(cn_pattern))
-    
+    cn_files = _first_glob("*.spectra-cn.fl.png", "*.spectra-cn.ln.png", "*.spectra-cn.st.png")
+
     for cn_file in cn_files:
         basename = os.path.basename(cn_file)
-        
+
         # Use Regex instead of dot counting.
         # This correctly handles prefixes with dots (e.g., gfArmOsto1.1)
-        # It looks for .asmX. or .hapX. or _asmX_ tags.
+        # It looks for .asmX. or .hapX. or _asmX_ tags.   
         if re.search(r'[\._](asm|hap)\d+[\._]', basename):
             # It has a tag -> Per-assembly plot
             plots['spectra_cn'].append(cn_file)
         else:
             # No tag -> Combined plot
             plots['spectra_cn_combined'] = cn_file
-    
+
     # For haploid, the only spectra-cn is the "combined" one, move it to spectra_cn list
     # (Because in haploid mode, the 'combined' plot IS the assembly plot)
     if not plots['spectra_cn'] and plots['spectra_cn_combined']:
         plots['spectra_cn'].append(plots['spectra_cn_combined'])
         plots['spectra_cn_combined'] = None
-    
+
     # Find spectra-asm plot
-    asm_pattern = os.path.join(merqury_dir, "*.spectra-asm.fl.png")
-    asm_files = glob.glob(asm_pattern)
+    asm_files = _first_glob("*.spectra-asm.fl.png", "*.spectra-asm.ln.png", "*.spectra-asm.st.png")
     if asm_files:
         plots['spectra_asm'] = asm_files[0]
-    
+
     return plots
 
 
-def get_rating(value, metric_type, haploid_number=None):
-    """Get star rating based on metric type and value."""
+def get_rating(value, metric_type, haploid_number=None, expected_chr_size=None):
+    """Get star rating based on metric type and value.
+
+    note: expected_chr_size : mean chromosome size (GoaT genome_size / haploid_number), in
+        bp, or None. Used ONLY for the small-genome carve-out on contig_n50 and
+        scaffold_n50: when a species' chromosomes are smaller than a megabase, a
+        contig/scaffold cannot physically reach the standard megabase/chromosome bar,
+        so the '***-' (meets-EBP) threshold drops to the chromosome size. When None or
+        >= 1 Mb, scoring is identical to the original absolute-bp thresholds.
+    """
     if value is None:
         return '····'
     
     if metric_type == 'gaps_per_gbp':
-        if value < 200:
+        if value <= 200:
             return '****'
-        elif value < 1000:
+        elif value <= 1000:
             return '***-'
-        elif value < 10000:
+        elif value <= 10000:
             return '**--'
         else:
             return '*---'
     
-    elif metric_type == 'scaffold_n50':
-        if value > 100_000_000:
+    elif metric_type in ('scaffold_n50', 'contig_n50'):
+        # Tiers are capped at chromosome scale (EBP "C"); see N50_BASE_TIERS
+        t4, t3, t2 = n50_tiers(metric_type, expected_chr_size)
+        if value >= t4:
             return '****'
-        elif value > 10_000_000:
+        elif value >= t3:
             return '***-'
-        elif value > 100_000:
-            return '**--'
-        else:
-            return '*---'
-    
-    elif metric_type == 'contig_n50':
-        if value > 10_000_000:
-            return '****'
-        elif value > 1_000_000:
-            return '***-'
-        elif value > 100_000:
+        elif value >= t2:
             return '**--'
         else:
             return '*---'
     
     elif metric_type == 'compl_single':
-        if value > 95:
+        if value >= 95:
             return '****'
-        elif value > 90:
+        elif value >= 90:
             return '***-'
-        elif value > 80:
+        elif value >= 80:
             return '**--'
         else:
             return '*---'
     
     elif metric_type == 'compl_dupl':
-        if value < 2:
+        if value <= 2:
             return '****'
-        elif value < 5:
+        elif value <= 5:
             return '***-'
-        elif value < 7:
+        elif value <= 10:
             return '**--'
         else:
             return '*---'
     
     elif metric_type == 'l90_haploid':
-        if haploid_number is None:
+        tiers = l90_tiers(haploid_number)
+        if tiers is None:
             return '····'
-        if value <= haploid_number:
+        t4, t3, t2 = tiers
+        if value <= t4:
             return '****'
-        elif value <= haploid_number + 100:
+        elif value <= t3:
             return '***-'
-        elif value <= haploid_number + 1000:
+        elif value <= t2:
             return '**--'
         else:
             return '*---'
     
     elif metric_type == 'merqury_qv':
-        if value > 50:
+        if value >= 50:
             return '****'
-        elif value > 40:
+        elif value >= 40:
             return '***-'
-        elif value > 30:
+        elif value >= 30:
             return '**--'
         else:
             return '*---'
     
     elif metric_type == 'merqury_completeness':
-        if value > 95:
+        if value >= 95:
             return '****'
-        elif value > 90:
+        elif value >= 90:
             return '***-'
-        elif value > 80:
+        elif value >= 80:
             return '**--'
         else:
             return '*---'
     
     elif metric_type == 'compl_frameshift':
-        if value < 2:
+        if value <= 2:
             return '****'
-        elif value < 5:
+        elif value <= 5:
             return '***-'
-        elif value < 15:
+        elif value <= 15:
             return '**--'
         else:
             return '*---'
-    
+
+    # ---- Hi-C ratings ----
+    elif metric_type == 'hic_unique_yield':      # % of input read pairs -> unique output pairs
+        if value >= 80:
+            return '****'
+        elif value >= 60:
+            return '***-'
+        elif value >= 40:
+            return '**--'
+        else:
+            return '*---'
+
+    elif metric_type == 'hic_valid_pairs':       # % UU pairs of all pairs
+        if value >= 90:
+            return '****'
+        elif value >= 80:
+            return '***-'
+        elif value >= 65:
+            return '**--'
+        else:
+            return '*---'
+
+    elif metric_type == 'hic_cis_trans':         # cis/trans ratio (not a percentage)
+        if value >= 4:
+            return '****'
+        elif value >= 2:
+            return '***-'
+        elif value >= 1:
+            return '**--'
+        else:
+            return '*---'
+
+    elif metric_type == 'hic_longrange_cis':     # % long-range cis (frac_cis_10kb+ * 100)
+        if value >= 50:
+            return '****'
+        elif value >= 40:
+            return '***-'
+        elif value >= 30:
+            return '**--'
+        else:
+            return '*---'
+
+    elif metric_type == 'hic_verylongrange_cis': # % very-long-range cis (frac_cis_40kb+ * 100)
+        if value >= 45:
+            return '****'
+        elif value >= 35:
+            return '***-'
+        elif value >= 25:
+            return '**--'
+        else:
+            return '*---'
+
     return '····'
 
 
@@ -574,6 +840,8 @@ def format_number(value):
         return "N/A"
     if isinstance(value, (int, float)):
         if isinstance(value, float):
+            if value != value or value in (float("inf"), float("-inf")):
+                return str(value)          # nan/inf (e.g. Merqury QV with no errors)
             if value < 10:
                 return f"{value:.4f}"
             elif value < 100:
@@ -618,16 +886,160 @@ def parse_inspector(filepath):
         return None
 
 
-def generate_report(species_name, assembly_id, gfastats_list, compleasm_list, 
+def parse_pairtools_stats(filepath):
+    """
+    Parse a pairtools stats file into Hi-C metrics.
+
+    The file is tab-separated key<TAB>value. We read it into a dict and pull
+    out the fields we need, then derive:
+      - valid_pair_rate   = pair_types/UU / total
+      - cis_trans_ratio   = cis / trans
+      - longrange_cis     = summary/frac_cis_10kb+ * 100
+      - longrange_cis_40k = summary/frac_cis_40kb+ * 100
+      - junk_cis          = (cis - cis_1kb+) / cis * 100
+    """
+    metrics = {
+        'total_pairs': None,
+        'uu_pairs': None,
+        'cis': None,
+        'trans': None,
+        'valid_pair_rate': None,
+        'cis_trans_ratio': None,
+        'frac_cis': None,
+        'longrange_cis': None,
+        'longrange_cis_40k': None,
+        'junk_cis': None,
+    }
+
+    try:
+        kv = {}
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.rstrip('\n')
+                if not line or '\t' not in line:
+                    continue
+                key, _, value = line.partition('\t')
+                kv[key.strip()] = value.strip()
+    except Exception as e:
+        print(f"Warning: Could not parse pairtools stats file {filepath}: {e}")
+        return metrics
+
+    def _int(key):
+        try:
+            return int(kv[key])
+        except (KeyError, ValueError):
+            return None
+
+    def _float(key):
+        try:
+            return float(kv[key])
+        except (KeyError, ValueError):
+            return None
+
+    metrics['total_pairs'] = _int('total')
+    metrics['uu_pairs'] = _int('pair_types/UU')
+    metrics['cis'] = _int('cis')
+    metrics['trans'] = _int('trans')
+    metrics['frac_cis'] = _float('summary/frac_cis')
+
+    # valid (unique-unique) pair rate, as % of all pairs
+    if metrics['uu_pairs'] is not None and metrics['total_pairs']:
+        metrics['valid_pair_rate'] = (metrics['uu_pairs'] / metrics['total_pairs']) * 100
+
+    # cis-to-trans ratio
+    if metrics['cis'] is not None and metrics['trans']:
+        metrics['cis_trans_ratio'] = metrics['cis'] / metrics['trans']
+
+    # long-range cis (>=10kb) as % of all contacts
+    frac_10kb = _float('summary/frac_cis_10kb+')
+    if frac_10kb is not None:
+        metrics['longrange_cis'] = frac_10kb * 100
+
+    # very-long-range cis (>=40kb) as % of all contacts
+    frac_40kb = _float('summary/frac_cis_40kb+')
+    if frac_40kb is not None:
+        metrics['longrange_cis_40k'] = frac_40kb * 100
+
+    # "Junk" cis fraction = cis contacts below 1 kb (self-ligation / dangling ends),
+    # as a % of all cis contacts: (cis - cis_1kb+) / cis. High -> noisier library.
+    cis_1kb = _int('cis_1kb+')
+    if metrics['cis'] and cis_1kb is not None:
+        metrics['junk_cis'] = ((metrics['cis'] - cis_1kb) / metrics['cis']) * 100
+
+    return metrics
+
+
+def parse_chromap_log(filepath):
+    """
+    Parse a chromap log and extract the Hi-C mapping-yield metric.
+
+    Pulls:
+      - MAPQ threshold   from the 'Parameters: ... MAPQ-threshold: N ...' line
+      - total reads      from 'Number of reads: N'  (these are INDIVIDUAL reads;
+                          read pairs = total_reads / 2)
+      - pair-level uni-mappings from '# uni-mappings: N, # multi-mappings: M, total: T'
+                          (the post-sort/filter pair counts, NOT the read-level
+                          'Number of uni-mappings')
+    Derives:
+      - unique_yield = pair-level uni-mappings / read pairs * 100
+    """
+    metrics = {
+        'mapq_threshold': None,
+        'read_pairs': None,
+        'uni_pairs': None,
+        'output_pairs': None,
+        'unique_yield': None,
+    }
+
+    try:
+        with open(filepath, 'r') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"Warning: Could not read chromap log {filepath}: {e}")
+        return metrics
+
+    mapq_match = re.search(r'MAPQ-threshold:\s*(\d+)', content)
+    if mapq_match:
+        metrics['mapq_threshold'] = int(mapq_match.group(1))
+
+    # "Number of reads: N" counts individual reads; a Hi-C pair is two reads.
+    reads_match = re.search(r'Number of reads:\s*(\d+)', content)
+    if reads_match:
+        metrics['read_pairs'] = int(reads_match.group(1)) // 2
+
+    # Pair-level counts appear as: "# uni-mappings: X, # multi-mappings: Y, total: Z"
+    pair_match = re.search(
+        r'#\s*uni-mappings:\s*(\d+),\s*#\s*multi-mappings:\s*(\d+),\s*total:\s*(\d+)',
+        content)
+    if pair_match:
+        metrics['uni_pairs'] = int(pair_match.group(1))
+        metrics['output_pairs'] = int(pair_match.group(3))
+    else:
+        # Fallback to the explicit "Number of output mappings (passed filters): N"
+        out_match = re.search(r'Number of output mappings \(passed filters\):\s*(\d+)', content)
+        if out_match:
+            metrics['output_pairs'] = int(out_match.group(1))
+
+    # pair-level unique yield = unique output pairs / input read pairs
+    if metrics['uni_pairs'] is not None and metrics['read_pairs']:
+        metrics['unique_yield'] = (metrics['uni_pairs'] / metrics['read_pairs']) * 100
+
+    return metrics
+
+
+def generate_report(species_name, assembly_id, gfastats_list, compleasm_list, busco_list, 
                    merqury_qv_values, merqury_completeness_values,
-                   haploid_number, haploid_source, taxon_id, family,
+                   haploid_number, haploid_source, taxon_id, family, resolution_level,
                    genomescope_plot, 
                    merqury_plots, hic_plots, blob_plots, fcs_gx_files,
-                   inspector_values, output_file):
+                   inspector_values, output_file, kmer_tool="MERQ",
+                   pairtools_list=None, chromap_list=None, expected_chr_size=None,
+                   merqury_both=(None, None)):
     """Generate the markdown report supporting 1 or 2 assemblies."""
     
     num_assemblies = len(gfastats_list)
     is_diploid = num_assemblies == 2
+    tool_display = "MerquryFK" if kmer_tool == "MERQ.FK" else "Merqury"
     
     # Build table data: list of tuples (metric, [(value1, rating1), (value2, rating2), ...])
     table_data = []
@@ -666,7 +1078,7 @@ def generate_report(species_name, assembly_id, gfastats_list, compleasm_list,
     
     # Scaffold N50
     values = [int(g.get('scaffold_n50', 0)) if g.get('scaffold_n50') else None for g in gfastats_list]
-    ratings = [get_rating(v, 'scaffold_n50') for v in values]
+    ratings = [get_rating(v, 'scaffold_n50', expected_chr_size=expected_chr_size) for v in values]
     add_metric("Scaffold N50", values, ratings)
     
     # Scaffold L50
@@ -686,7 +1098,7 @@ def generate_report(species_name, assembly_id, gfastats_list, compleasm_list,
     
     # Contig N50
     values = [int(g.get('contig_n50', 0)) if g.get('contig_n50') else None for g in gfastats_list]
-    ratings = [get_rating(v, 'contig_n50') for v in values]
+    ratings = [get_rating(v, 'contig_n50', expected_chr_size=expected_chr_size) for v in values]
     add_metric("Contig N50", values, ratings)
     
     # Contig L50
@@ -746,15 +1158,52 @@ def generate_report(species_name, assembly_id, gfastats_list, compleasm_list,
             formatted_values = [f"{v:.2f}%" if v is not None else "N/A" for v in values]
             add_metric(frame_label, formatted_values, ratings)
     
+    # ---- BUSCO metrics (skip if not available) ----
+    
+    # Check if any BUSCO data is available
+    has_busco = any(
+        b.get('eukaryota_single') is not None or b.get('other_single') is not None 
+        for b in busco_list
+    )
+    
+    if has_busco:
+        # BUSCO Sing. (e) - eukaryota
+        values = [b.get('eukaryota_single') for b in busco_list]
+        if any(v is not None for v in values):
+            ratings = [get_rating(v, 'compl_single') for v in values]
+            formatted_values = [f"{v:.2f}%" if v is not None else "N/A" for v in values]
+            add_metric("BUSCO Sing.  (e)", formatted_values, ratings)
+        
+        # BUSCO Dupl. (e)
+        values = [b.get('eukaryota_dupl') for b in busco_list]
+        if any(v is not None for v in values):
+            ratings = [get_rating(v, 'compl_dupl') for v in values]
+            formatted_values = [f"{v:.2f}%" if v is not None else "N/A" for v in values]
+            add_metric("BUSCO Dupl.  (e)", formatted_values, ratings)
+        
+        # BUSCO Sing. (x) - other lineage
+        values = [b.get('other_single') for b in busco_list]
+        if any(v is not None for v in values):
+            ratings = [get_rating(v, 'compl_single') for v in values]
+            formatted_values = [f"{v:.2f}%" if v is not None else "N/A" for v in values]
+            add_metric("BUSCO Sing.  (x)", formatted_values, ratings)
+        
+        # BUSCO Dupl. (x)
+        values = [b.get('other_dupl') for b in busco_list]
+        if any(v is not None for v in values):
+            ratings = [get_rating(v, 'compl_dupl') for v in values]
+            formatted_values = [f"{v:.2f}%" if v is not None else "N/A" for v in values]
+            add_metric("BUSCO Dupl.  (x)", formatted_values, ratings)
+
     # ---- Merqury metrics ----
     
     if merqury_qv_values and any(v is not None for v in merqury_qv_values):
         ratings = [get_rating(v, 'merqury_qv') for v in merqury_qv_values]
-        add_metric("MERQ QV", merqury_qv_values, ratings)
+        add_metric(f"{kmer_tool} QV", merqury_qv_values, ratings)
     
     if merqury_completeness_values and any(v is not None for v in merqury_completeness_values):
         ratings = [get_rating(v, 'merqury_completeness') for v in merqury_completeness_values]
-        add_metric("MERQ Compl.", merqury_completeness_values, ratings)
+        add_metric(f"{kmer_tool} Compl.", merqury_completeness_values, ratings)
     
     # ---- Inspector metrics ----
     
@@ -807,15 +1256,21 @@ def generate_report(species_name, assembly_id, gfastats_list, compleasm_list,
         if c.get('other_lineage'):
             other_lineage = c['other_lineage']
             break
-    
+
     # Prepare haploid number information
     if haploid_number is not None:
-        haploid_info = f"‡ = Haploid number is {haploid_number} ({haploid_source}, [GoaT](https://goat.genomehubs.org))<br>"
+        if resolution_level == 'genus':
+            haploid_info = f"‡ = Haploid number is {haploid_number} (genus-level estimate, {haploid_source}, [GoaT](https://goat.genomehubs.org))<br>"
+        else:
+            haploid_info = f"‡ = Haploid number is {haploid_number} ({haploid_source}, [GoaT](https://goat.genomehubs.org))<br>"
     else:
         haploid_info = "‡ = Haploid number not found on [GoaT](https://goat.genomehubs.org)<br>"
-    
+
     # Prepare header info
-    taxon_id_str = str(taxon_id) if taxon_id is not None else "not found"
+    if resolution_level == 'genus':
+        taxon_id_str = f"{taxon_id}, genus-level" if taxon_id is not None else "not found"
+    else:
+        taxon_id_str = str(taxon_id) if taxon_id is not None else "not found"
     family_str = family if family is not None else "not found"
     
     # Build the complete report
@@ -834,12 +1289,34 @@ def generate_report(species_name, assembly_id, gfastats_list, compleasm_list,
     # Add legend only for metrics that were included
     report_lines.append("")
     
-    if has_compleasm:
-        report_lines.append("e = eukaryota (odb12)<br>")
+    # Check if Eukaryota data was actually generated by either tool
+    has_eukaryota = any(
+        m.get('eukaryota_single') is not None 
+        for m in compleasm_list + busco_list
+    )
+
+    # Grab dynamic names (check compleasm first, then busco, mirroring other_lineage below)
+    euka_lineage = next((m.get('eukaryota_lineage') for m in compleasm_list + busco_list if m.get('eukaryota_lineage')), "eukaryota (odb12.2)")
+    
+    other_lineage = next((m.get('other_lineage') for m in compleasm_list if m.get('other_lineage')), None)
+    if not other_lineage:
+        other_lineage = next((m.get('other_lineage') for m in busco_list if m.get('other_lineage')), None)
+
+    # Print legend ONLY for the lineages that were actually used
+    if has_compleasm or has_busco:
+        if has_eukaryota:
+            report_lines.append(f"e = {euka_lineage}<br>")
         if other_lineage:
             report_lines.append(f"x = {other_lineage}<br>")
     
     report_lines.append(haploid_info)
+
+    # Combined asm1+asm2 k-mer values (only present with 2 assemblies)
+    both_qv, both_compl = merqury_both
+    if both_qv is not None:
+        report_lines.append(f"{kmer_tool} QV for both: {format_number(both_qv)}<br>")
+    if both_compl is not None:
+        report_lines.append(f"{kmer_tool} Compl. for both: {format_number(both_compl)}<br>")
     
     # Add GenomeScope2 section if plot exists
     if genomescope_plot and os.path.exists(genomescope_plot):
@@ -867,7 +1344,7 @@ def generate_report(species_name, assembly_id, gfastats_list, compleasm_list,
             report_lines.extend([
                 "",
                 "---",
-                "### Merqury Plots",
+                f"### {tool_display} Plots",
             ])
             
             # Spectra-asm plot (combined assembly spectra)
@@ -900,6 +1377,96 @@ def generate_report(species_name, assembly_id, gfastats_list, compleasm_list,
                     "",
                 ])
     
+    # Add Hi-C Metrics section
+    pt_list = pairtools_list or []
+    cm_list = chromap_list or []
+
+    def _hic_get(lst, i, key):
+        entry = lst[i] if i < len(lst) and lst[i] else {}
+        return entry.get(key)
+
+    # (label, metric_type, per-assembly values, value formatter)
+    hic_specs = [
+        ("Hi-C Uniq. Yield", 'hic_unique_yield',
+         [_hic_get(cm_list, i, 'unique_yield') for i in range(num_assemblies)], '{:.2f}%'),
+        ("Hi-C Valid Pairs", 'hic_valid_pairs',
+         [_hic_get(pt_list, i, 'valid_pair_rate') for i in range(num_assemblies)], '{:.2f}%'),
+        ("Hi-C Cis/Trans", 'hic_cis_trans',
+         [_hic_get(pt_list, i, 'cis_trans_ratio') for i in range(num_assemblies)], '{:.2f}'),
+        ("Hi-C Cis 10kb+", 'hic_longrange_cis',
+         [_hic_get(pt_list, i, 'longrange_cis') for i in range(num_assemblies)], '{:.2f}%'),
+        ("Hi-C Cis 40kb+", 'hic_verylongrange_cis',
+         [_hic_get(pt_list, i, 'longrange_cis_40k') for i in range(num_assemblies)], '{:.2f}%'),
+    ]
+
+    hic_rows = []
+    for label, mtype, vals, fmt in hic_specs:
+        if any(v is not None for v in vals):
+            row = [(fmt.format(v) if v is not None else "N/A", get_rating(v, mtype))
+                   for v in vals]
+            hic_rows.append((label, row))
+
+    if hic_rows:
+        hic_metric_width = max(len("metric"), max(len(r[0]) for r in hic_rows))
+        hic_value_widths = [
+            max(len(f"asm{i+1} value"), max(len(str(r[1][i][0])) for r in hic_rows))
+            for i in range(num_assemblies)
+        ]
+        hic_rating_width = len("asm1 rating")
+
+        hic_hdr = [f"{'metric':<{hic_metric_width}}"]
+        hic_sep = ['-' * hic_metric_width]
+        for i in range(num_assemblies):
+            hic_hdr.append(f"{'asm' + str(i+1) + ' value':>{hic_value_widths[i]}}")
+            hic_hdr.append(f"{'asm' + str(i+1) + ' rating':<{hic_rating_width}}")
+            hic_sep.append('-' * (hic_value_widths[i] - 1) + ':')
+            hic_sep.append('-' * hic_rating_width)
+
+        report_lines.extend([
+            "",
+            "---",
+            "### Hi-C Metrics",
+            "",
+            "| " + " | ".join(hic_hdr) + " |",
+            "| " + " | ".join(hic_sep) + " |",
+        ])
+        for label, asm_data in hic_rows:
+            hic_parts = [f"{label:<{hic_metric_width}}"]
+            for i, (value, rating) in enumerate(asm_data):
+                hic_parts.append(f"{str(value):>{hic_value_widths[i]}}")
+                hic_parts.append(f"{('`' + rating + '`'):<{hic_rating_width}}")
+            report_lines.append("| " + " | ".join(hic_parts) + " |")
+
+        # MAPQ note: yields are only comparable within a fixed chromap MAPQ threshold.
+        mapqs = [_hic_get(cm_list, i, 'mapq_threshold') for i in range(num_assemblies)]
+        if any(v is not None for v in mapqs):
+            report_lines.append("")
+            if num_assemblies == 1:
+                report_lines.append(f"chromap MAPQ threshold: {mapqs[0]}<br>")
+            else:
+                mapq_parts = ", ".join(
+                    f"asm{i+1}={m if m is not None else 'N/A'}" for i, m in enumerate(mapqs))
+                report_lines.append(f"chromap MAPQ threshold: {mapq_parts}<br>")
+
+        # "Junk" cis = fraction of cis contacts below 1 kb (self-ligation / dangling ends):
+        # (cis - cis_1kb+) / cis. A high value flags a noisier Hi-C library.
+        junk = [_hic_get(pt_list, i, 'junk_cis') for i in range(num_assemblies)]
+        if any(v is not None for v in junk):
+            jk_parts = []
+            jk_high = []
+            for i, v in enumerate(junk):
+                s = "N/A" if v is None else f"{v:.2f}%"
+                jk_parts.append(s if num_assemblies == 1 else f"asm{i+1}={s}")
+                if v is not None and v > 20:
+                    jk_high.append(f"asm{i+1}")
+            jk_line = "junk cis (<1kb): " + ", ".join(jk_parts)
+            if jk_high:
+                if num_assemblies == 1:
+                    jk_line += " - WARNING: high junk (>20%)"
+                else:
+                    jk_line += " - WARNING: high junk (>20%) for " + ", ".join(jk_high)
+            report_lines.append(jk_line + "<br>")
+
     # Add Hi-C Contact Maps section
     if hic_plots:
         # Filter to ensure files actually exist
@@ -989,6 +1556,111 @@ def generate_report(species_name, assembly_id, gfastats_list, compleasm_list,
     print(f"Report generated successfully: {output_file}")
 
 
+def _fmt_bp(value):
+    """Compact bp for log lines: 8.21 Mb / 912 kb / 430 bp."""
+    if value is None:
+        return "n/a"
+    value = float(value)
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f} Mb"
+    if value >= 1_000:
+        return f"{value / 1_000:.0f} kb"
+    return f"{value:.0f} bp"
+
+
+def log_run_diagnostics(goat_data, expected_chr_size, gfastats_list,
+                        compleasm_list, busco_list):
+    """Print everything that shapes the ratings but never appears in the report.
+    """
+    num_assemblies = len(gfastats_list)
+
+    # ---- what GoaT gave us ----
+    level = goat_data.get('resolution_level')
+    if level == 'genus':
+        print(f"[goat]    WARNING: species not found, resolved at GENUS level - "
+              f"haploid number and genome size are genus estimates")
+    print(f"[goat]    taxon_id={goat_data.get('taxon_id')} "
+          f"lineage={goat_data.get('family')} (resolved at {level or 'n/a'} level)")
+    print(f"[goat]    haploid_number={goat_data.get('haploid_number')} "
+          f"(source: {goat_data.get('haploid_source') or 'n/a'})")
+    gs = goat_data.get('genome_size')
+    print(f"[goat]    genome_size={_fmt_bp(gs)} "
+          f"(source: {goat_data.get('genome_size_source') or 'n/a'})")
+
+    # ---- the derived scale and the thresholds it produces ----
+    if expected_chr_size:
+        print(f"[scaling] expected chromosome = genome_size / haploid_number "
+              f"= {_fmt_bp(expected_chr_size)}")
+    else:
+        print("[scaling] WARNING: no expected chromosome size (GoaT genome_size or "
+              "haploid_number missing) - N50 tiers stay at their absolute values "
+              "and may be unreachable for a small genome")
+
+    for mtype, label in (('scaffold_n50', 'scaffold N50'), ('contig_n50', 'contig N50  ')):
+        t4, t3, t2 = n50_tiers(mtype, expected_chr_size)
+        base = N50_BASE_TIERS[mtype]
+        capped = " [capped at chromosome scale]" if (t4, t3, t2) != base else ""
+        print(f"[scaling] {label} tiers: **** >= {_fmt_bp(t4)} | "
+              f"***- >= {_fmt_bp(t3)} | **-- >= {_fmt_bp(t2)}{capped}")
+
+    l90 = l90_tiers(goat_data.get('haploid_number'))
+    if l90:
+        print(f"[scaling] L90 tiers (n={goat_data.get('haploid_number')}): "
+              f"**** <= {l90[0]} | ***- <= {l90[1]} | **-- <= {l90[2]}")
+
+    # ---- per-assembly sanity checks ----
+    for i, g in enumerate(gfastats_list):
+        tag = f"asm{i+1}"
+        total_bp = int(g['total_bp']) if g.get('total_bp') else None
+
+        if g.get('_missing'):
+            print(f"[check]   {tag}: WARNING: gfastats fields not matched "
+                  f"({', '.join(g['_missing'])}) - these show as N/A with a '····' "
+                  f"rating; check the gfastats version/wording in {g.get('_source')}")
+
+        # Assembly size vs GoaT. A large mismatch means the taxon match, the
+        # ploidy, or the assembly itself is off - and expected_chr_size, which
+        # sets the N50 bars, is derived from that same GoaT size.
+        if total_bp and gs:
+            delta = (total_bp - float(gs)) / float(gs) * 100
+            flag = "  <-- WARNING: >30% off, check taxon match / ploidy" if abs(delta) > 30 else ""
+            print(f"[check]   {tag}: assembly {_fmt_bp(total_bp)} vs GoaT genome size "
+                  f"{_fmt_bp(gs)} ({delta:+.1f}%){flag}")
+
+        # Reachability. A tier above the assembly's own total length can never be
+        # awarded, whatever the assembly quality - this check catches
+        # a mis-scaled ladder even when GoaT has no genome size at all.
+        if total_bp:
+            for mtype, label in (('scaffold_n50', 'scaffold N50'), ('contig_n50', 'contig N50')):
+                t4, t3, t2 = n50_tiers(mtype, expected_chr_size)
+                for stars, bar in (('****', t4), ('***-', t3)):
+                    if bar > total_bp:
+                        print(f"[check]   {tag}: WARNING: {label} '{stars}' bar "
+                              f"{_fmt_bp(bar)} exceeds the whole assembly "
+                              f"({_fmt_bp(total_bp)}) - tier unreachable")
+                if expected_chr_size and t4 > expected_chr_size:
+                    print(f"[check]   {tag}: WARNING: {label} '****' bar {_fmt_bp(t4)} "
+                          f"exceeds one chromosome ({_fmt_bp(expected_chr_size)})")
+
+        gaps = g.get('gaps')
+        if gaps is not None:
+            print(f"[{tag}]    gfastats: {g.get('scaffolds', '?')} scaffolds / "
+                  f"{g.get('contigs', '?')} contigs, {gaps} gaps "
+                  f"({_fmt_bp(g.get('total_gap_bp'))} total)")
+
+    # ---- raw counts behind the completeness percentages ----
+    for i, c in enumerate(compleasm_list[:num_assemblies]):
+        if not c or c.get('_counts') is None:
+            continue
+        counts = ", ".join(f"{k}={v}" for k, v in c['_counts'].items() if v)
+        print(f"[asm{i+1}]    compleasm {c.get('_lineage_dir')}: {counts} "
+              f"(n={c.get('_n_markers')})")
+        if c.get('_complete_copies'):
+            print(f"[asm{i+1}]    frameshifts: {c['_frameshifted_copies']}/"
+                  f"{c['_complete_copies']} complete copies "
+                  f"({c.get('frameshift_rate', 0):.2f}%)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Generate GEP2 genome assembly stats report',
@@ -996,7 +1668,7 @@ def main():
         epilog="""
 Examples:
   # Single assembly (haploid mode)
-  python make_report.py -s Homo_sapiens -a hg38 \\
+  python make_gep2_report.py -s Elephas_maximus -a mEleMax1_new \\
     -g stats1.txt -c compl1.txt \\
     -q merqury.qv -m merqury.completeness.stats \\
     --genomescope-plot linear_plot.png \\
@@ -1004,7 +1676,7 @@ Examples:
     -o report.md --also-pdf
 
   # Two assemblies (diploid mode)
-  python make_report.py -s Homo_sapiens -a hg38 \\
+  python make_gep2_report.py -s Elephas_maximus -a mEleMax1_new \\
     -g stats1.txt stats2.txt -c compl1.txt compl2.txt \\
     -q merqury.qv -m merqury.completeness.stats \\
     -o report.md
@@ -1023,6 +1695,8 @@ Examples:
                        help='compleasm summary.txt file(s) - one per assembly')
     parser.add_argument('--compleasm-full', required=False, nargs='+', default=[],
                        help='compleasm {lineage}_odb{version}/full_table.tsv file(s) - one per assembly')
+    parser.add_argument('--busco-summary', required=False, nargs='+', default=[],
+                       help='BUSCO short_summary.txt file(s) - one per assembly')
     parser.add_argument('-q', '--merqury-qv', required=False,
                        help='Merqury QV file (*.qv)')
     parser.add_argument('-m', '--merqury-completeness', required=False,
@@ -1031,6 +1705,10 @@ Examples:
                        help='Merqury output directory (for finding plots)')    
     parser.add_argument('--genomescope-plot', required=False,
                        help='GenomeScope2 linear plot PNG')
+    parser.add_argument('--pairtools-stats', required=False, nargs='+', default=[],
+                       help='pairtools stats file(s) (pairtools_stats.txt) - one per assembly')
+    parser.add_argument('--chromap-log', required=False, nargs='+', default=[],
+                       help='chromap log file(s) - one per assembly')
     parser.add_argument('--hic', required=False, nargs='+', default=[],
                        help='Hi-C contact-map png file(s) - one per assembly')
     parser.add_argument('--blob', required=False, nargs='+', default=[],
@@ -1082,7 +1760,17 @@ Examples:
         haploid_source = goat_data['haploid_source']
         taxon_id = goat_data['taxon_id']
         family = goat_data['family']
-        
+        resolution_level = goat_data['resolution_level']
+        genome_size = goat_data['genome_size']
+
+        # Mean chromosome size (genome_size / haploid_number) drives the small-genome
+        # star carve-out. None => carve-out disabled and scoring is unchanged.
+        expected_chr_size = None
+        if genome_size and haploid_number and haploid_number > 0:
+            try:
+                expected_chr_size = float(genome_size) / haploid_number
+            except (TypeError, ValueError):
+                expected_chr_size = None
         if goat_data['error']:
             print(f"Warning: Could not retrieve all GoaT data: {goat_data['error']}")
         else:
@@ -1111,9 +1799,23 @@ Examples:
         else:
             # Empty compleasm results
             compleasm_list = [{'eukaryota_single': None, 'eukaryota_dupl': None,
-                              'other_lineage': None, 'other_single': None, 
+                              'eukaryota_lineage': None,
+                              'other_lineage': None, 'other_single': None,
                               'other_dupl': None}] * num_assemblies
         
+        # Parse BUSCO files (if provided) independently
+        print("Parsing BUSCO output(s)...")
+        busco_list = []
+        if args.busco_summary:
+            for busco_file in args.busco_summary:
+                busco_list.append(parse_busco_summary(busco_file))
+        else:
+            # Empty BUSCO results
+            busco_list = [{'eukaryota_single': None, 'eukaryota_dupl': None,
+                           'eukaryota_lineage': None,
+                           'other_lineage': None, 'other_single': None,
+                           'other_dupl': None}] * num_assemblies
+
         # Parse Merqury files (if provided)
         merqury_qv_values = [None] * num_assemblies
         merqury_completeness_values = [None] * num_assemblies
@@ -1127,8 +1829,19 @@ Examples:
             merqury_completeness_values = parse_merqury_completeness(
                 args.merqury_completeness, num_assemblies)
         
+        # Combined asm1+asm2 values ('both' rows), shown below the table
+        merqury_both = (None, None)
+        if num_assemblies == 2:
+            merqury_both = (
+                parse_merqury_both(args.merqury_qv, "qv") if args.merqury_qv else None,
+                parse_merqury_both(args.merqury_completeness, "completeness")
+                if args.merqury_completeness else None)
+
         # Find Merqury plots
         merqury_plots = find_merqury_plots(args.merqury_dir, args.assembly)
+
+        # Identify the k-mer QV tool from the file header (Merqury vs MerquryFK)
+        kmer_tool = detect_kmer_tool(args.merqury_qv, args.merqury_completeness)
         
         # Parse Inspector files (if provided)
         inspector_values = [None] * num_assemblies
@@ -1136,7 +1849,39 @@ Examples:
             print("Parsing Inspector output(s)...")
             for i, insp_file in enumerate(args.Inspector[:num_assemblies]):
                 inspector_values[i] = parse_inspector(insp_file)
-        
+
+        # Hi-C metrics inputs. The two files are complementary (unique yield comes
+        # from chromap, the pair/cis metrics from pairtools), so they're normally given
+        # together - but either alone is allowed and just yields a partial section.
+        if bool(args.pairtools_stats) != bool(args.chromap_log):
+            print("Note: only one of --pairtools-stats / --chromap-log provided; "
+                  "the Hi-C Metrics section will be partial")
+        for _name, _files in (("pairtools-stats", args.pairtools_stats),
+                              ("chromap-log", args.chromap_log)):
+            if _files and len(_files) != num_assemblies:
+                print(f"Warning: {len(_files)} --{_name} file(s) given but {num_assemblies} "
+                      f"assembly(ies); files are matched by position "
+                      f"(extras ignored, missing shown as N/A)")
+
+        # Parse Hi-C metrics files (if provided) - one per assembly
+        pairtools_list = [None] * num_assemblies
+        if args.pairtools_stats:
+            print("Parsing pairtools stats...")
+            for i, pt_file in enumerate(args.pairtools_stats[:num_assemblies]):
+                pairtools_list[i] = parse_pairtools_stats(pt_file)
+
+        chromap_list = [None] * num_assemblies
+        if args.chromap_log:
+            print("Parsing chromap log(s)...")
+            for i, cm_file in enumerate(args.chromap_log[:num_assemblies]):
+                chromap_list[i] = parse_chromap_log(cm_file)
+
+        # Everything that shapes the ratings but never reaches the report
+        print("-" * 72)
+        log_run_diagnostics(goat_data, expected_chr_size, gfastats_list,
+                            compleasm_list, busco_list)
+        print("-" * 72)
+
         # Create output directory if needed
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         
@@ -1147,19 +1892,26 @@ Examples:
             args.assembly, 
             gfastats_list, 
             compleasm_list,
+            busco_list,
             merqury_qv_values,
             merqury_completeness_values,
             haploid_number, 
             haploid_source, 
             taxon_id,
             family,
+            resolution_level,
             args.genomescope_plot,
             merqury_plots,
             args.hic,
             args.blob,
             args.fcs_gx,
             inspector_values,
-            args.output
+            args.output,
+            kmer_tool=kmer_tool,
+            pairtools_list=pairtools_list,
+            chromap_list=chromap_list,
+            expected_chr_size=expected_chr_size,
+            merqury_both=merqury_both
         )
         
         # Convert to PDF if requested

@@ -307,6 +307,14 @@ rule A03_create_mini_report:
         echo "[GABi] Command: $cmd"
         $cmd
 
+        # Footer: point to GEP2 for a full QC of the reference
+        (
+            echo ""
+            echo "<br>"
+            echo ""
+            echo "*This is a quick check of the reference assembly. For a thorough quality control (k-mer QV, contamination screening and more), run a full [GEP2](https://github.com/diegomics/GEP2) analysis.*"
+        ) >> {output.report}
+
         # Cleanup ALL extracted compleasm directories (eukaryota + target lineage)
         for cleanup_dir in $COMPLEASM_CLEANUP; do
             if [ -d "$cleanup_dir" ]; then
