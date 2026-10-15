@@ -2,7 +2,7 @@
 # by Diego De Panis, 2026
 # note: AI tools may have been used to improve, clean and/or comment this version of the code
 
-GABi_VER = "0.1.0-alpha_build.261013"
+GABi_VER = "0.1.0-alpha_build.261015"
 
 # Debug verbosity (set to True for detailed DAG building messages)
 VERBOSE = False
