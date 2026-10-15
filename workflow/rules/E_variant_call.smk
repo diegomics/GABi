@@ -416,14 +416,15 @@ def _get_sample_read_category(species, assembly, sample_id):
 
 def _vc_pairhmm_impl(read_category):
     """
-    Determine PairHMM implementation based on read category and USE_AVX config.
+    Determine PairHMM implementation based on read category and USE_AVX
+    (set in the Snakefile, next to ODB_VERSION).
 
     USE_AVX options:
       auto: FASTEST_AVAILABLE for short reads, LOGLESS_CACHING for long reads
       on:   FASTEST_AVAILABLE for all (may crash on some CPUs or with long reads)
       off:  LOGLESS_CACHING for all (safest, slowest)
     """
-    mode = str(config.get("USE_AVX", "auto")).lower()
+    mode = str(USE_AVX).lower()
 
     if mode in {"off", "false", "no"}:
         # Disabled: always use safe implementation

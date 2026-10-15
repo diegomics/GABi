@@ -88,9 +88,6 @@ CALLER: deep
 # VCF resolution | "block" (gVCF, faster) / "basepair" (per-site, much larger files)
 RESOLUTION: block
 
-# PairHMM AVX (GATK only!) | "auto" (AVX for short reads. Default) / "on" (force) / "off"
-USE_AVX: auto
-
 # Tech priority for calling when >1 type/sample | e.g. hifi>illumina>ont
 ## Used to break ties between technologies that reach GOOD_TECH_COV (see above).
 DATA_PRIORITY: hifi>illumina>ont
@@ -106,7 +103,7 @@ JOINT_GENO: off
 
 
 # Variants QC & tagging ---------------------------------------------------------------------------
-# Full docs: github.com/diegomics/GAME/wiki/Control_Panel#tagging
+# Full docs: github.com/diegomics/GABi/wiki/Control_Panel#tagging
 
 # Add INFO (TYPE, MASKED) and FILTER (LOW_DP, LOW_GQ...) tags | "on" / "off"
 RUN_TAGGING: off
@@ -132,7 +129,7 @@ TINY_CONTIG_BP: 1000000
 KEEP_RAW_BCF: on
 
 # Joint genotyping tags
-# Only if JOINT_GENO: on AND RUN_TAGGING: on. Site-level only (handle per-sample QC downstream)
+# Only if JOINT_GENO: merge or multi AND RUN_TAGGING: on. Site-level only (handle per-sample QC downstream)
 MIN_AQ: 10           # [joint] min allele quality (INFO/AQ from GLnexus)
 MIN_JOINT_QUAL: 1    # [joint] min site QUAL
 MAX_MISSING: 0.5     # [joint] max fraction of ./. samples (-> LOW_CALL_RATE)

@@ -97,7 +97,7 @@ def _final_group_bam(sp, asm, sid, grp):
     else:
         return os.path.join(
             bdir,
-            f"{stem}.markdup.bam" if _as_bool(config.get("DEDUP_LONG", False)) else f"{stem}.sorted.bam",
+            f"{stem}.markdup.bam" if _as_bool(config.get("DEDUP_LONG", True)) else f"{stem}.sorted.bam",
         )
 
 def _qc_dir(sp, asm, sid):
@@ -281,7 +281,7 @@ rule D02_map_long_reads:
                 "samples", "{sample_id}", "BAMs",
                 "{read_type}_Path{idx}" + _SEP + "{base}.sorted.bam"
             ),
-            _as_bool(config.get("DEDUP_LONG", False))
+            _as_bool(config.get("DEDUP_LONG", True))
         ),
         bai=_maybe_temp(
             os.path.join(
@@ -289,7 +289,7 @@ rule D02_map_long_reads:
                 "samples", "{sample_id}", "BAMs",
                 "{read_type}_Path{idx}" + _SEP + "{base}.sorted.bam.bai"
             ),
-            _as_bool(config.get("DEDUP_LONG", False))
+            _as_bool(config.get("DEDUP_LONG", True))
         )
     wildcard_constraints:
         read_type=r"(hifi|ont)",

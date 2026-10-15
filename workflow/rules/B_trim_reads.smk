@@ -795,7 +795,7 @@ def _get_qc_reports_for_multiqc(w):
                 if rt == "hifi":
                     want(os.path.join(reports_dir, f"Path{idx}_{base}_uli_mqc.yaml"))
                     # Filtering stats if enabled
-                    if _as_bool(config.get("FILTER_HIFI", False)):
+                    if _as_bool(config.get("FILTER_HIFI", True)):
                         want(os.path.join(reports_dir, f"Path{idx}_{base}_bbduk.stats"))
 
                 # Corrected ONT NanoPlot

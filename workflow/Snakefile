@@ -1,4 +1,4 @@
-# GABi - Genomes Analysis Made Easy
+# GABi - Genome Analysis for Biodiversity
 # by Diego De Panis, 2026
 # note: AI tools may have been used to improve, clean and/or comment this version of the code
 
@@ -145,7 +145,6 @@ def extract_filename_from_url(url: str) -> str:
     return filename if filename else "downloaded_file"
 
 # --- Config value coercion ---
-# GABi_TEST_HELPERS_BEGIN
 _TRUE_WORDS = {"1", "true", "t", "yes", "y", "on"}
 _FALSE_WORDS = {"0", "false", "f", "no", "n", "off", ""}
 
@@ -175,10 +174,8 @@ def _as_bool(x, default=False):
     raise ValueError(
         f"[GABi] {x!r} is not a yes/no value. Use on/off (or true/false, yes/no)."
     )
-# GABi_TEST_HELPERS_END
 
 # --- Read-type normalization ---
-# GABi_TEST_HELPERS_BEGIN
 # read_type is free text: NomNom identifies the column but does not validate or
 # map its values, so whatever the submitter typed reaches GABi verbatim. That
 # makes this column the pipeline's weakest input, and a wrong guess is worse
@@ -261,7 +258,6 @@ def accepted_read_types():
         f"          {canon:9s} {', '.join(sorted(_READ_TYPE_ALIASES[canon]))}"
         for canon in ("hifi", "ont", "illumina", "10x", "hic")
     )
-# GABi_TEST_HELPERS_END
 
 # --- Read-type predicates ---
 def _is_long(rt):
@@ -290,9 +286,6 @@ def _is_10x(rt):
 #    return rt_norm == "hic"
 
 # --- Read-path utilities ---
-# GABi_TEST_HELPERS_BEGIN
-# Everything between these markers must stay free of Snakemake/config state:
-# tests/test_naming.py extracts this block and exec()s it verbatim.
 _READ_EXTS = (".fastq.gz", ".fq.gz", ".fastq", ".fq", ".gz")
 # Separator for BAM file names
 _SEP = "_"
@@ -440,7 +433,6 @@ def _pe_base(r1, r2):
     # Degenerate input ('_1.fq.gz' / '_2.fq.gz') would leave nothing to name
     # the library after: keep R1's stem rather than emit an empty wildcard.
     return (left + right) or a
-# GABi_TEST_HELPERS_END
 
 # Pairs already reported by the mate cross-check. _enumerate_groups() runs many
 # times during DAG construction; the warning is worth seeing once.
@@ -554,26 +546,6 @@ CONTAINERS = data.get("containers", {})
 
 if not CONTAINERS:
     raise ValueError(f"{containers_path} is missing a top-level 'containers:' mapping")
-
-
-# -------------------------------------------------------------------------------
-# ORTHODB VERSION (compleasm)
-# -------------------------------------------------------------------------------
-
-# Single source of truth for the OrthoDB release compleasm uses. Everything that
-# names a lineage DB derives from it: the A00 download flags, the shared DB that
-# A02 copies per job, and `compleasm run --odb`. compleasm stores each lineage as
-# "<lineage>_<odb>" (e.g. diptera_odb12), so two versions in one library_path give
-# you a second DB instead of an error - hence one value for the whole pipeline.
-# Override in the control panel with e.g. ODB_VERSION: odb12.2
-ODB_VERSION = str(config.get("ODB_VERSION", "odb12")).strip()
-if not ODB_VERSION.startswith("odb"):
-    ODB_VERSION = "odb" + ODB_VERSION
-if not re.fullmatch(r"odb\d+(\.\d+)?", ODB_VERSION):
-    print("[GABi] ERROR: ODB_VERSION must look like 'odb12' or 'odb12.2', got: "
-          f"{config.get('ODB_VERSION')!r}")
-    sys.exit(1)
-if IS_MAIN: print(f"[GABi] OrthoDB release for compleasm: {ODB_VERSION}")
 
 
 # -------------------------------------------------------------------------------
@@ -799,6 +771,25 @@ gabi_get_workdir() {{
 }}
 """
 )
+
+
+# -------------------------------------------------------------------------------
+# ORTHODB VERSION (compleasm)
+# -------------------------------------------------------------------------------
+
+# OrthoDB version used for gene completeness (same for compleasm and BUSCO)
+ODB_VERSION = "odb12.2"
+if IS_MAIN: print(f"[GABi] OrthoDB release for compleasm: {ODB_VERSION}")
+
+
+# -------------------------------------------------------------------------------
+# PAIRHMM AVX (GATK HaplotypeCaller only)
+# -------------------------------------------------------------------------------
+
+# "auto" (AVX for short reads, LOGLESS_CACHING for long reads) / "on" (AVX for all) / "off" (never)
+# AVX on long reads may crash on some CPUs, hence "auto". Used by _vc_pairhmm_impl() in E_variant_call.smk
+USE_AVX = "auto"
+if IS_MAIN: print(f"[GABi] PairHMM AVX mode for GATK (if selected): {USE_AVX}")
 
 
 # -------------------------------------------------------------------------------
@@ -1225,7 +1216,7 @@ def _get_sample_node(species, assembly, sample_id, read_type_key=None):
             if is_pe:
                 trim = _as_bool(config.get("TRIM_PE", True))
             elif is_hifi:
-                trim = _as_bool(config.get("FILTER_HIFI", False))
+                trim = _as_bool(config.get("FILTER_HIFI", True))
             else:
                 trim = False
 
@@ -1446,14 +1437,12 @@ def _enumerate_groups(rt, reads_dict, ctx=""):
             yield {"idx": i, "rt": rt, "kind": "pe", "r1": r1, "r2": r2, "base": base}
 
 
-# GABi_TEST_HELPERS_BEGIN
 # samples_config does not change after load, and _collect_sample_reads() is
 # called from input functions for every job during DAG construction. It used
 # to stop at the first assembly containing the sample; now it always walks the
 # whole config, so without this the cost grows with the number of assemblies
 # on every call.
 _SAMPLE_READS_CACHE = {}
-# GABi_TEST_HELPERS_END
 
 
 def _collect_sample_reads(sample_id, read_type_key=None):
@@ -1525,9 +1514,6 @@ def _collect_sample_reads(sample_id, read_type_key=None):
     return found
 
 
-# Every flag the code reads as a yes/no. Checked once at load so a typo is
-# reported next to the table's own problems instead of quietly meaning "off".
-# GABi_TEST_HELPERS_BEGIN
 # Suffixes GABi appends to mark its own processed files. Module B's link and
 # compress rules exclude them from the `base` wildcard, so a SOURCE file whose
 # name already ends in one cannot be bound by any producer - the run dies with
@@ -1540,10 +1526,10 @@ _RESERVED_BASE_SUFFIXES = {
     "long": ("_corrected", "_filtered"),
     "pe": ("_trimmed",),
 }
-# GABi_TEST_HELPERS_END
 
 
-# GABi_TEST_HELPERS_BEGIN
+# Every flag the code reads as a yes/no. Checked once at load so a typo is
+# reported next to the table's own problems instead of quietly meaning "off".
 # JOINT_GENO is deliberately absent: it is off/merge/multi, not a flag.
 _BOOL_FLAGS = (
     "CORRECT_ONT",
@@ -1561,7 +1547,6 @@ _BOOL_FLAGS = (
     "RUN_TAGGING",
     "TRIM_PE",
 )
-# GABi_TEST_HELPERS_END
 
 
 def validate_samples_config():
@@ -1809,7 +1794,7 @@ def joint_geno_mode():
     parse_joint_geno() takes the RAW value: it is a three-way setting
     (off/merge/multi), so passing it through _as_bool() first would collapse
     'merge' and 'multi' to False - the exact bug parse_joint_geno() was
-    written to fix. tests/test_flags.py guards this.
+    written to fix.
     """
     return parse_joint_geno(config.get("JOINT_GENO", False))
 
@@ -1860,7 +1845,7 @@ def _outputs_for_group(sp, asm, sid, grp, trim):
     base = grp["base"]
 
     if grp["kind"] == "long":
-        if rt == "hifi" and _as_bool(config.get("FILTER_HIFI", False)):
+        if rt == "hifi" and _as_bool(config.get("FILTER_HIFI", True)):
             name = f"Path{i}_{base}_filtered.fq.gz"
             return [os.path.join(data_base, sid, rt, "processed", name)]
         elif rt == "ont" and _as_bool(config.get("CORRECT_ONT", False)):
@@ -2199,7 +2184,7 @@ def get_read_processing_results():
                                 base_path, "reports", f"Path{idx}_{base}_uli_mqc.yaml"
                             ))
                             # Filtered reads if enabled
-                            if _as_bool(config.get("FILTER_HIFI", False)):
+                            if _as_bool(config.get("FILTER_HIFI", True)):
                                 outs.append(os.path.join(
                                     base_path, "processed", f"Path{idx}_{base}_filtered.fq.gz"
                                 ))
@@ -2295,7 +2280,7 @@ def get_mapping_results():
                                 os.path.join(bdir, f"{stem}.sorted.bam.bai"),
                             ]
                     else:  # long reads
-                        if _as_bool(config.get("DEDUP_LONG", False)):
+                        if _as_bool(config.get("DEDUP_LONG", True)):
                             outs += [
                                 os.path.join(bdir, f"{stem}.markdup.bam"),
                                 os.path.join(bdir, f"{stem}.markdup.bam.bai"),
