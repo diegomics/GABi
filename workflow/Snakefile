@@ -2,7 +2,7 @@
 # by Diego De Panis, 2026
 # note: AI tools may have been used to improve, clean and/or comment this version of the code
 
-GABi_VER = "0.1.0-alpha_build.261015"
+GABi_VER = "0.1.0-alpha_build.261015-2"
 
 # Debug verbosity (set to True for detailed DAG building messages)
 VERBOSE = False
@@ -771,25 +771,6 @@ gabi_get_workdir() {{
 }}
 """
 )
-
-
-# -------------------------------------------------------------------------------
-# ORTHODB VERSION (compleasm)
-# -------------------------------------------------------------------------------
-
-# OrthoDB version used for gene completeness (same for compleasm and BUSCO)
-ODB_VERSION = "odb12.2"
-if IS_MAIN: print(f"[GABi] OrthoDB release for compleasm: {ODB_VERSION}")
-
-
-# -------------------------------------------------------------------------------
-# PAIRHMM AVX (GATK HaplotypeCaller only)
-# -------------------------------------------------------------------------------
-
-# "auto" (AVX for short reads, LOGLESS_CACHING for long reads) / "on" (AVX for all) / "off" (never)
-# AVX on long reads may crash on some CPUs, hence "auto". Used by _vc_pairhmm_impl() in E_variant_call.smk
-USE_AVX = "auto"
-if IS_MAIN: print(f"[GABi] PairHMM AVX mode for GATK (if selected): {USE_AVX}")
 
 
 # -------------------------------------------------------------------------------

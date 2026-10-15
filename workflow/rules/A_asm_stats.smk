@@ -5,6 +5,17 @@
 # ===============================================================================
 
 # -------------------------------------------------------------------------------
+#  ORTHODB VERSION (compleasm, not a user setting)
+# -------------------------------------------------------------------------------
+
+# OrthoDB version used for gene completeness (same for compleasm and BUSCO)
+# Also written to the A00 and A02 logs.
+ODB_VERSION = "odb12.2"
+if IS_MAIN and _as_bool(config.get("RUN_COMPL", True)):
+    print(f"[GABi] OrthoDB release for compleasm: {ODB_VERSION}")
+
+
+# -------------------------------------------------------------------------------
 #  HELPER FUNCTIONS
 # -------------------------------------------------------------------------------
 
@@ -63,6 +74,7 @@ rule A00_download_compleasm_db:
         mkdir -p $(dirname {log})
         exec > {log} 2>&1
 
+        echo "[GABi] OrthoDB release: {params.odb}"
         mkdir -p {params.db_dir}
         compleasm download eukaryota --odb {params.odb} --library_path {params.db_dir}
         touch {output.flag}

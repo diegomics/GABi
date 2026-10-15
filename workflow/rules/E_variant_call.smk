@@ -5,6 +5,18 @@
 # ===============================================================================
 
 # -------------------------------------------------------------------------------
+#  PAIRHMM AVX (GATK HaplotypeCaller only, not a user setting)
+# -------------------------------------------------------------------------------
+
+# "auto" (AVX for short reads, LOGLESS_CACHING for long reads) / "on" (AVX for all) / "off" (never)
+# AVX on long reads may crash on some CPUs, hence "auto". Used by _vc_pairhmm_impl() below,
+# and written to every E01 HaplotypeCaller log.
+USE_AVX = "auto"
+if IS_MAIN and normalize_caller(config.get("CALLER", "deep")) == "gatk":
+    print(f"[GABi] PairHMM AVX mode for GATK: {USE_AVX}")
+
+
+# -------------------------------------------------------------------------------
 #  OUTPUTH PATH TEMPLATES (literal patterns only)
 # -------------------------------------------------------------------------------
 
@@ -417,7 +429,7 @@ def _get_sample_read_category(species, assembly, sample_id):
 def _vc_pairhmm_impl(read_category):
     """
     Determine PairHMM implementation based on read category and USE_AVX
-    (set in the Snakefile, next to ODB_VERSION).
+    (set at the top of this file).
 
     USE_AVX options:
       auto: FASTEST_AVAILABLE for short reads, LOGLESS_CACHING for long reads
@@ -1053,7 +1065,7 @@ rule E01_haplotypecaller_scattered:
 
         echo "[GABi] HaplotypeCaller for $READ_CAT reads (resolution={params.bp_mode})"
         echo "[GABi] Memory: XMX=${{XMX}}m, buffer=${{BUF}}, threads={threads}"
-        echo "[GABi] Parameters: pairhmm=$PAIRHMM, pcr=$PCR_MODEL, haplotypes=$MAX_HAP, reads_start=$MAX_READS, asm_region=$MAX_ASM"
+        echo "[GABi] Parameters: pairhmm=$PAIRHMM (USE_AVX: {USE_AVX}), pcr=$PCR_MODEL, haplotypes=$MAX_HAP, reads_start=$MAX_READS, asm_region=$MAX_ASM"
 
         # RESOLUTION-DEPENDENT FLAGS
         # -------------------------------------------------------------------
