@@ -1530,6 +1530,94 @@ _BOOL_FLAGS = (
 )
 
 
+# ADAPTERS_PE: what fastp trims from short paired-end reads on top of its
+# overlap analysis, which finds adapters from the read pair alone. A keyword or
+# a path to an adapter FASTA. "illumina" is itself just a FASTA shipped with
+# GABi, so it and a user's own file go down exactly the same path in B02.
+_ADAPTERS_PE_KEYWORDS = ("illumina", "auto", "overlap")
+ILLUMINA_PE_ADAPTERS_FA = str(scripts_dir / "adapters_pe_illumina.fa")
+_FASTA_EXTS = (".fa", ".fasta", ".fna", ".fas")
+
+
+def _adapter_fasta_problem(path):
+    """Why fastp could not use this adapter FASTA as intended, or None.
+
+    fastp reads it as plain text, upper-cases it, drops sequences under 6 bp
+    without failing, and keys entries by their header line - so an unusable or
+    partly-ignored file would otherwise run "fine" and trim less than expected.
+    """
+    if path.lower().endswith((".gz", ".bgz", ".bz2", ".xz", ".zip")):
+        return "the adapter FASTA must be uncompressed (fastp reads it as plain text)"
+    try:
+        with open(path) as fh:
+            lines = [l.strip() for l in fh if l.strip()]
+    except (OSError, UnicodeDecodeError) as e:
+        return f"cannot read {path}: {e}"
+    entries, header, seq = [], None, []
+    for line in lines:
+        if line.startswith(">"):
+            if header is not None:
+                entries.append((header, "".join(seq)))
+            header, seq = line[1:].strip(), []
+        elif header is None:
+            return f"{path} is not a FASTA file (it must start with a '>' header line)"
+        else:
+            seq.append(line)
+    if header is not None:
+        entries.append((header, "".join(seq)))
+    if not entries:
+        return f"{path} contains no FASTA entries"
+    headers = [h for h, _ in entries]
+    dups = sorted({h for h in headers if headers.count(h) > 1})
+    if dups:
+        return (f"{path} repeats the header(s) {', '.join(dups)} - fastp keeps only "
+                f"one sequence per header, so give each adapter its own name")
+    for h, s in entries:
+        bad = sorted(set(s.upper()) - set("ACGTN"))
+        if bad:
+            return f"{path}: adapter '{h}' contains {''.join(bad)} (only A, C, G, T, N)"
+    if not any(len(s) >= 6 for _, s in entries):
+        return f"{path} has no adapter of 6 bp or more (fastp ignores shorter ones)"
+    return None
+
+
+def parse_adapters_pe(value):
+    """ADAPTERS_PE -> (mode, fasta). mode: 'auto' | 'overlap' | 'fasta'.
+
+    'illumina' resolves to mode 'fasta' with GABi's own adapter file. Raises
+    ValueError with a message meant for the user.
+    """
+    accepted = "Use illumina, auto, overlap, or the path to an adapter FASTA file."
+    if value is None:
+        raise ValueError(f"has no value. {accepted}")
+    if isinstance(value, bool):
+        # YAML turns an unquoted on/off/yes/no into True/False.
+        raise ValueError(f"{'on' if value else 'off'} is not a choice here. {accepted}")
+    raw = str(value).strip()
+    key = raw.lower()
+    if key == "illumina":
+        fasta = ILLUMINA_PE_ADAPTERS_FA
+    elif key in _ADAPTERS_PE_KEYWORDS:
+        return key, None
+    elif "/" in raw or key.endswith(_FASTA_EXTS) or key.endswith(tuple(e + ".gz" for e in _FASTA_EXTS)):
+        fasta = os.path.abspath(raw)
+        if os.path.isdir(fasta):
+            raise ValueError(f"{fasta} is a folder, not an adapter FASTA file")
+        if not os.path.isfile(fasta):
+            raise ValueError(f"adapter FASTA not found: {fasta}")
+    else:
+        raise ValueError(f"{raw!r} is not recognised. {accepted}")
+    problem = _adapter_fasta_problem(fasta)
+    if problem:
+        raise ValueError(problem)
+    return "fasta", fasta
+
+
+def adapters_pe_mode():
+    """Configured ADAPTERS_PE, parsed. Missing key -> the 'illumina' default."""
+    return parse_adapters_pe(config.get("ADAPTERS_PE", "illumina"))
+
+
 def validate_samples_config():
     """Check the whole table once, before anything is scheduled.
 
@@ -1560,6 +1648,11 @@ def validate_samples_config():
             _as_bool(value)
         except ValueError as e:
             problems.append(f"  {flag}: {str(e).replace('[GABi] ', '')}")
+
+    try:
+        adapters_pe_mode()
+    except ValueError as e:
+        problems.append(f"  ADAPTERS_PE: {e}")
 
     for sp_name, sp_data in (samples_config.get("sp_name") or {}).items():
         if not sp_data or "asm_id" not in sp_data:

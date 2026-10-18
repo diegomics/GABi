@@ -77,6 +77,48 @@ def _mk_dirs(log):
     os.makedirs(os.path.dirname(str(log)), exist_ok=True)
 
 
+def _fastp_adapter_args():
+    """fastp options for the configured ADAPTERS_PE (validated at load)."""
+    mode, fasta = adapters_pe_mode()
+    if mode == "auto":
+        return "--detect_adapter_for_pe"
+    if mode == "overlap":
+        return ""
+    return f'--adapter_fasta "{fasta}"'
+
+
+# A guess fastp took from its built-in list is printed with its name line
+# (">Illumina TruSeq Adapter Read 1") before the sequence; a guess it made up
+# from over-represented sequence is printed bare. That bare line is the signal.
+_FASTP_DETECT_RE = re.compile(r"^Detecting adapter sequence for (read[12])\.\.\.\s*$")
+
+
+def _tandem_repeat_unit(seq, max_period=12, max_mismatch=0.1):
+    """Repeat unit if seq is a short tandem repeat (telomere, satellite, ...), else None.
+    """
+    seq = seq.upper()
+    for k in range(1, max_period + 1):
+        n = len(seq) - k
+        if n >= 2 * k and sum(seq[i] != seq[i + k] for i in range(n)) <= max_mismatch * n:
+            return seq[:k]
+    return None
+
+
+def _fastp_unknown_adapter_guesses(text):
+    """[(read, sequence)] for each adapter fastp guessed without matching its known list."""
+    lines = text.splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        m = _FASTP_DETECT_RE.match(line.strip())
+        if not m:
+            continue
+        nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        if not nxt or nxt.startswith(">") or nxt.startswith("No adapter detected"):
+            continue
+        out.append((m.group(1), nxt))
+    return out
+
+
 _MISSING_IN = os.path.join(
     config["OUT_FOLDER"], "GABi_results", ".missing_input_placeholder_DO_NOT_CREATE"
 )
@@ -636,6 +678,9 @@ rule B02_trim_pe_reads:
     log:
         os.path.join(_DATA_BASE, "{sample_id}", "{read_type}", "logs",
                      "B02_trim_pe_reads.Path{idx}.{base}.log")
+    params:
+        adapter_mode = lambda w: config.get("ADAPTERS_PE", "illumina"),
+        adapter_args = lambda w: _fastp_adapter_args()
     run:
         rt, grp = _pick_group_sample(wildcards)
         if grp["kind"] != "pe":
@@ -648,12 +693,36 @@ rule B02_trim_pe_reads:
         tenx = _is_10x(rt)
         extra = "--trim_front1 23 --trim_front2 0" if tenx else ""
 
+        log_path = str(log)
+        with open(log_path, "a") as fh:
+            fh.write(f"[GABi] ADAPTERS_PE: {params.adapter_mode}\n")
+        # The log is appended to, so it may hold earlier attempts. Remember where
+        # this one starts, so the check below reads only this run's output.
+        start = os.path.getsize(log_path)
+
         cmd = (
             f'fastp -i "{input.r1}" -I "{input.r2}" -o "{output.r1}" -O "{output.r2}" -w {threads} '
-            f'--detect_adapter_for_pe -l 50 --overrepresentation_analysis {extra} '
-            f'-j "{output.json}" -h "{output.html}" >> "{log}" 2>&1'
+            f'{params.adapter_args} -l 50 --overrepresentation_analysis {extra} '
+            f'-j "{output.json}" -h "{output.html}" >> "{log_path}" 2>&1'
         )
         shell(cmd)
+
+        if params.adapter_args == "--detect_adapter_for_pe":
+            with open(log_path) as fh:
+                fh.seek(start)
+                guesses = _fastp_unknown_adapter_guesses(fh.read())
+            for read, seq in guesses:
+                unit = _tandem_repeat_unit(seq)
+                hint = (f" It is a short tandem repeat (unit {unit}), e.g. a telomere or "
+                        f"satellite repeat." if unit else "")
+                msg = (f"[GABi] WARNING: {wildcards.sample_id} Path{wildcards.idx}: fastp guessed "
+                       f"the {read} adapter as {seq[:30]}..., which is not a known adapter. "
+                       f"It may be genome sequence, now trimmed from every read that "
+                       f"contains it.{hint} Check the fastp report, or set "
+                       f"ADAPTERS_PE: illumina and re-trim this sample.")
+                with open(log_path, "a") as fh:
+                    fh.write(msg + "\n")
+                print(msg)
 
 
 # -------------------------------------------------------------------------------

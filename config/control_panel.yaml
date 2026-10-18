@@ -51,6 +51,11 @@ MASKING: auto
 # Trim short paired-end reads (Illumina/10x) | "on" (default) / "off"
 TRIM_PE: on
 
+# Extra adapter search for short PE reads | "illumina" (default) / "auto" / "overlap" / "/path.fa"
+## illumina: only TruSeq + Nextera | auto: guess from reads (may mistake repeats for adapters,
+## warns in the log) | overlap: no extra search, only trim read-overlap adapter | path: your FASTA
+ADAPTERS_PE: illumina
+
 # Filter adapter-containing HiFi reads | "on" (default) / "off"
 FILTER_HIFI: on
 
